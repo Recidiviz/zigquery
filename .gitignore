@@ -24,3 +24,6 @@ __pycache__/
 /.venv/
 /test/python/.venv/
 .pytest_cache/
+
+# npm's install of the suite in test/node/; package.json and package-lock.json are tracked.
+/test/node/node_modules/

@@ -1,0 +1,14 @@
+{
+  "name": "zigquery-node-integration",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=4"
+  },
+  "dependencies": {
+    "@google-cloud/bigquery": "9.5.0"
+  }
+}

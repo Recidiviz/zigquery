@@ -190,6 +190,54 @@ jobs:
           uv sync --locked
           uv run pytest -n 4 -v -rxX
 
+  # The @google-cloud/bigquery suite in test/node, against an image built the same way as
+  # python-integration's. It covers the client paths downstream Node services take.
+  node-integration:
+    name: node integration (Docker image)
+    needs: shim
+    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: shim
+        uses: ./.github/actions/shim
+        with:
+          platform: linux-x64
+      - uses: ./.github/actions/zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build image
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/image"
+          zig build dist -Drelease=true \
+            -Dshim-dylib=${{ steps.shim.outputs.path }} \
+            -Dshim-static-obj=${{ steps.shim.outputs.static-path }} \
+            --prefix "$ctx/dist"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES "$ctx/dist/"
+          docker build -f Dockerfile -t zigquery-emulator:ci "$ctx"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: test/node/package-lock.json
+
+      - name: npm test
+        working-directory: test/node
+        env:
+          BIGQUERY_EMULATOR_REPOSITORY: zigquery-emulator
+          BIGQUERY_EMULATOR_VERSION: ci
+        run: |
+          npm ci --ignore-scripts
+          npm test
+
   # Both generated codecs come from committed .fdsets and are easy to forget
   # when one of them moves. gen-proto is a host tool that does not link the
   # engine, so no shim.
