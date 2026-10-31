@@ -1288,9 +1288,14 @@ pub const Server = struct {
             return badRequest(arena, "failed to decode request body");
         };
 
+        const job_id = switch (try s.claimJobId(arena, project_id, job)) {
+            .id => |id| id,
+            .refused => |response| return response,
+        };
+
         return switch (jobConfigKind(job)) {
-            .query => s.handleQueryJob(arena, req, project_id, job),
-            .copy => s.handleCopyConfig(arena, project_id, job),
+            .query => s.handleQueryJob(arena, req, project_id, job_id, job),
+            .copy => s.handleCopyConfig(arena, project_id, job_id, job),
             .load => s.handleLoadConfig(arena, req, project_id, job),
             .extract => badRequest(arena, "configuration.extract is not supported"),
             .none => badRequest(
@@ -1313,10 +1318,57 @@ pub const Server = struct {
         return .none;
     }
 
+    /// The id a new job takes: the request's jobReference.jobId, or a fresh one when it names
+    /// none. rest/v2/JobReference
+    const JobIdClaim = union(enum) {
+        id: []const u8,
+        /// The answer to a request whose jobId is malformed or names a job that exists.
+        refused: http_server.Response,
+    };
+
+    fn claimJobId(
+        s: *Server,
+        arena: std.mem.Allocator,
+        project_id: []const u8,
+        job: *const pb.Job,
+    ) !JobIdClaim {
+        const requested = if (job.job_reference) |ref| ref.job_id else null;
+        const job_id = requested orelse
+            return .{ .id = try query_handler.randomId(arena, &s.rng) };
+        if (!isValidJobId(job_id)) return .{ .refused = try badRequest(
+            arena,
+            try std.fmt.allocPrint(
+                arena,
+                "Invalid job ID \"{s}\". Job IDs must be alphanumeric (plus underscores " ++
+                    "and dashes) and must be at most 1024 characters long.",
+                .{job_id},
+            ),
+        ) };
+        if (s.jobs.get(job_id) != null) return .{ .refused = .{
+            .status = .conflict,
+            .body = try errors.body(arena, .duplicate, try std.fmt.allocPrint(
+                arena,
+                "Already Exists: Job {s}:US.{s}",
+                .{ project_id, job_id },
+            )),
+        } };
+        return .{ .id = job_id };
+    }
+
+    /// Letters, digits, underscores and dashes, 1 to 1,024 of them. rest/v2/JobReference
+    fn isValidJobId(job_id: []const u8) bool {
+        if (job_id.len == 0 or job_id.len > 1024) return false;
+        for (job_id) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+        }
+        return true;
+    }
+
     fn handleCopyConfig(
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        job_id: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
         const parsed = copy_handler.parse(arena, job) catch |err| switch (err) {
@@ -1324,7 +1376,7 @@ pub const Server = struct {
             else => return badRequest(arena, copy_handler.parseErrorMessage(err)),
         };
         const copy = parsed orelse return badRequest(arena, "configuration.copy is required");
-        return s.handleCopyJob(arena, project_id, copy);
+        return s.handleCopyJob(arena, project_id, job_id, copy);
     }
 
     /// A load job posted to `/jobs` rather than to the upload endpoint, so it names its data
@@ -1512,7 +1564,10 @@ pub const Server = struct {
             dst.table_id,
         );
 
-        const job_id = try query_handler.randomId(arena, &s.rng);
+        const job_id = switch (try s.claimJobId(arena, project_id, job)) {
+            .id => |id| id,
+            .refused => |response| return response,
+        };
         const unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000);
 
         // CREATE_NEVER reports a missing destination in the job result.
@@ -1692,7 +1747,7 @@ pub const Server = struct {
             .load = spec,
             .outcome = outcome,
         });
-        try s.jobs.put(project_id, job_id, .load, .{
+        try s.jobs.put(project_id, job_id, .load, "", .{
             .names = &.{},
             .types = &.{},
             .cells = &.{},
@@ -1722,6 +1777,7 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         req: *const http_server.Request,
         project_id: []const u8,
+        job_id: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
         const sql = jobs_handler.queryFromJobConfig(job) orelse {
@@ -1734,7 +1790,6 @@ pub const Server = struct {
             => return badRequest(arena, "invalid query parameter"),
         };
 
-        const job_id = try query_handler.randomId(arena, &s.rng);
         const job_t0 = nowSeed();
 
         // Go's jobsInsertHandler never calls internaltypes.Format — only
@@ -1829,9 +1884,11 @@ pub const Server = struct {
         }
 
         var resource: std.ArrayList(u8) = .empty;
+        const destination_table_id = try query_handler.randomId(arena, &s.rng);
         try jobs_handler.writeJobResource(arena, &resource, .{
             .project_id = project_id,
             .job_id = job_id,
+            .destination_table_id = destination_table_id,
             .sql = sql,
             .endpoint = s.endpoint,
             .total_bytes = res.total_bytes,
@@ -1839,7 +1896,14 @@ pub const Server = struct {
             .outcome = res.set.?.outcome,
         });
 
-        try s.jobs.put(project_id, job_id, .query, res.set.?, resource.items);
+        try s.jobs.put(
+            project_id,
+            job_id,
+            .query,
+            destination_table_id,
+            res.set.?,
+            resource.items,
+        );
         // The destination table the resource above advertises. Registered now,
         // eagerly, because it costs nothing to: the rows are already in the
         // store and the table is a view onto them rather than a copy
@@ -1882,7 +1946,7 @@ pub const Server = struct {
         return names.toOwnedSlice(arena);
     }
 
-    /// Makes a finished job's result readable as `<project>._anon.<job_id>`.
+    /// Makes a finished job's result readable as `<project>._anon.<destination_table_id>`.
     ///
     /// Two halves, and neither copies a row. A synthetic `TableSpec` so the
     /// GoogleSQL analyzer resolves the name — memory-only, because the rows
@@ -1917,7 +1981,7 @@ pub const Server = struct {
         const name_path = try job_arena.alloc([]const u8, 3);
         name_path[0] = try job_arena.dupe(u8, project_id);
         name_path[1] = job_rows_vtab.anon_segment;
-        name_path[2] = job.job_id;
+        name_path[2] = job.destination_table_id;
         const table_spec = try job_arena.create(zigquery.spec.TableSpec);
         table_spec.* = .{ .name_path = name_path, .columns = columns };
 
@@ -1980,6 +2044,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        job_id: []const u8,
         copy: copy_handler.CopySpec,
     ) !http_server.Response {
         for (copy.sources) |src| {
@@ -2002,7 +2067,6 @@ pub const Server = struct {
             ) orelse return notFound(arena, try tableNotFound(arena, src));
         }
 
-        const job_id = try query_handler.randomId(arena, &s.rng);
         const unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000);
 
         const prior_metadata: []const u8 = if (try s.db.catalogTable(
@@ -2043,7 +2107,7 @@ pub const Server = struct {
         });
         // No result set: a copy job's rows are in the destination, and getQueryResults refuses
         // a job that is not a query job.
-        try s.jobs.put(project_id, job_id, .copy, .{
+        try s.jobs.put(project_id, job_id, .copy, "", .{
             .names = &.{},
             .types = &.{},
             .cells = &.{},
@@ -2403,6 +2467,13 @@ fn jobIdOf(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     return v.object.get("jobReference").?.object.get("jobId").?.string;
 }
 
+/// `configuration.query.destinationTable.tableId` out of a query job resource.
+fn destinationOf(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const query = v.object.get("configuration").?.object.get("query").?;
+    return query.object.get("destinationTable").?.object.get("tableId").?.string;
+}
+
 /// The single cell of a one-row, one-column response.
 fn onlyCell(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     const cells = try cellsOf(arena, body);
@@ -2476,6 +2547,69 @@ test "jobs.query binds a named scalar parameter" {
     );
     try testing.expectEqual(std.http.Status.ok, res.status);
     try testing.expectEqualStrings("hix", try onlyCell(arena, res.body));
+}
+
+test "jobs.insert keeps the client's jobId and refuses it a second time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const body =
+        \\{"jobReference":{"projectId":"test","jobId":"nightly_export-42"},
+        \\ "configuration":{"query":{"query":"SELECT 7 AS n","useLegacySql":false}}}
+    ;
+    const first = try request(s, arena, .POST, "/projects/test/jobs", body);
+    try testing.expectEqual(std.http.Status.ok, first.status);
+    try testing.expectEqualStrings("nightly_export-42", try jobIdOf(arena, first.body));
+
+    const results = try request(s, arena, .GET, "/projects/test/queries/nightly_export-42", "");
+    try testing.expectEqual(std.http.Status.ok, results.status);
+
+    const again = try request(s, arena, .POST, "/projects/test/jobs", body);
+    try testing.expectEqual(std.http.Status.conflict, again.status);
+    try testing.expectEqualStrings(
+        \\{"error":{"errors":[{"reason":"duplicate","location":"","debugInfo":"","message":"Already Exists: Job test:US.nightly_export-42"}],"code":409,"message":"Already Exists: Job test:US.nightly_export-42"}}
+    , again.body);
+}
+
+test "a client jobId that is no table id still gets a destination table" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const insert = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"jobReference":{"jobId":"9f0c2d4e-7b1a-4c3e-8d2f-5a6b7c8d9e0f"},
+        \\ "configuration":{"query":{"query":"SELECT 3 AS v","useLegacySql":false}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, insert.status);
+    const table_id = try destinationOf(arena, insert.body);
+    try testing.expect(!std.mem.eql(u8, table_id, try jobIdOf(arena, insert.body)));
+
+    const sql = try std.fmt.allocPrint(arena, "SELECT v FROM `_anon`.`{s}`", .{table_id});
+    var rows = try s.db.query(sql, &.{}, .{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 3), (try rows.next()).?[0].int);
+}
+
+test "jobs.insert refuses a malformed jobId" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"jobReference":{"jobId":"has a space"},
+        \\ "configuration":{"query":{"query":"SELECT 1","useLegacySql":false}}}
+    );
+    try testing.expectEqual(std.http.Status.bad_request, res.status);
 }
 
 test "jobs.insert binds a positional parameter" {
@@ -2835,18 +2969,18 @@ test "a query job's destination table is readable the moment the job returns" {
         \\"useLegacySql":false}}}
     );
     try testing.expectEqual(std.http.Status.ok, insert.status);
-    const job_id = try jobIdOf(arena, insert.body);
+    const table_id = try destinationOf(arena, insert.body);
 
     // The resource names it, and tables.get now answers on it.
     try testing.expect(std.mem.indexOf(u8, insert.body, "\"datasetId\":\"_anon\"") != null);
-    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{job_id});
+    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{table_id});
     const got = try request(s, arena, .GET, path, "");
     try testing.expectEqual(std.http.Status.ok, got.status);
     try testing.expect(std.mem.indexOf(u8, got.body, "\"name\":\"n\"") != null);
 
     // And it holds the job's rows -- read back through the engine, which is
     // the path CreateReadSession and ReadRows take.
-    const sql = try std.fmt.allocPrint(arena, "SELECT n, t FROM `_anon`.`{s}`", .{job_id});
+    const sql = try std.fmt.allocPrint(arena, "SELECT n, t FROM `_anon`.`{s}`", .{table_id});
     var rows = try s.db.query(sql, &.{}, .{});
     defer rows.deinit();
     var seen: usize = 0;
@@ -2883,7 +3017,9 @@ test "the destination table and getQueryResults agree, because they share one co
     );
     try testing.expectEqualStrings("1767268800.0", try onlyCell(arena, results.body));
 
-    const sql = try std.fmt.allocPrint(arena, "SELECT ts, s FROM `_anon`.`{s}`", .{job_id});
+    const sql = try std.fmt.allocPrint(arena, "SELECT ts, s FROM `_anon`.`{s}`", .{
+        try destinationOf(arena, insert.body),
+    });
     var rows = try s.db.query(sql, &.{}, .{});
     defer rows.deinit();
     const row = (try rows.next()).?;
@@ -3103,9 +3239,9 @@ test "a DDL job registers no destination table" {
         \\"useLegacySql":false}}}
     );
     try testing.expectEqual(std.http.Status.ok, insert.status);
-    const job_id = try jobIdOf(arena, insert.body);
+    const table_id = try destinationOf(arena, insert.body);
 
-    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{job_id});
+    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{table_id});
     const got = try request(s, arena, .GET, path, "");
     try testing.expectEqual(std.http.Status.not_found, got.status);
 }
@@ -3124,9 +3260,9 @@ test "a zero-row SELECT still gets an empty destination table" {
         \\{"configuration":{"query":{"query":
         \\"SELECT n FROM UNNEST(GENERATE_ARRAY(1, 0)) AS n","useLegacySql":false}}}
     );
-    const job_id = try jobIdOf(arena, insert.body);
+    const table_id = try destinationOf(arena, insert.body);
 
-    const sql = try std.fmt.allocPrint(arena, "SELECT n FROM `_anon`.`{s}`", .{job_id});
+    const sql = try std.fmt.allocPrint(arena, "SELECT n FROM `_anon`.`{s}`", .{table_id});
     var rows = try s.db.query(sql, &.{}, .{});
     defer rows.deinit();
     try testing.expectEqual(@as(?[]const driver.Cell, null), try rows.next());
@@ -3140,10 +3276,10 @@ test "two jobs' destination tables do not collide in the shared dataset" {
     var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
     defer s.deinit();
 
-    const a = try jobIdOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
+    const a = try destinationOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
         \\{"configuration":{"query":{"query":"SELECT 1 AS v","useLegacySql":false}}}
     )).body);
-    const b = try jobIdOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
+    const b = try destinationOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
         \\{"configuration":{"query":{"query":"SELECT 2 AS v","useLegacySql":false}}}
     )).body);
     try testing.expect(!std.mem.eql(u8, a, b));
@@ -4295,11 +4431,10 @@ test "a query's result table cannot be patched into the catalog" {
     const insert = try request(s, arena, .POST, "/projects/test/jobs",
         \\{"configuration":{"query":{"query":"SELECT 1 AS n"}}}
     );
-    const job_id = try jobIdOf(arena, insert.body);
     const path = try std.fmt.allocPrint(
         arena,
         "/projects/test/datasets/_anon/tables/{s}",
-        .{job_id},
+        .{try destinationOf(arena, insert.body)},
     );
 
     const patched = try request(s, arena, .PATCH, path, "{\"description\":\"phantom\"}");

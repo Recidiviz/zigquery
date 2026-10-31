@@ -58,6 +58,8 @@ pub fn parametersFromJobConfig(
 pub const JobResource = struct {
     project_id: []const u8,
     job_id: []const u8,
+    /// The result's table in the anonymous dataset.
+    destination_table_id: []const u8,
     sql: []const u8,
     endpoint: []const u8,
     /// Go accumulates len() of each rendered cell string.
@@ -77,7 +79,7 @@ pub fn writeJobResource(
     var dest = pb.TableReference{
         .project_id = j.project_id,
         .dataset_id = job_rows_vtab.anon_segment,
-        .table_id = j.job_id,
+        .table_id = j.destination_table_id,
     };
     var use_legacy = pb.BoolValue{ .value = false };
     var cfg_query = pb.JobConfigurationQuery{
@@ -194,6 +196,7 @@ test "job resource matches the Go emulator's shape" {
     try writeJobResource(arena, &out, .{
         .project_id = "test",
         .job_id = "JOBID",
+        .destination_table_id = "ANONID",
         .sql = "SELECT 1 AS col",
         .endpoint = "0.0.0.0:19050",
         .total_bytes = 1,
@@ -205,7 +208,7 @@ test "job resource matches the Go emulator's shape" {
     // Compared by value: the resource's keys follow the proto's field order,
     // not the alphabetical order google-api-go-client's structs produced.
     try json_pb.expectJsonEqual(
-        \\{"configuration":{"jobType":"QUERY","query":{"destinationTable":{"datasetId":"_anon","projectId":"test","tableId":"JOBID"},"priority":"INTERACTIVE","query":"SELECT 1 AS col","useLegacySql":false}},"jobReference":{"jobId":"JOBID","projectId":"test"},"kind":"bigquery#job","selfLink":"http://0.0.0.0:19050/bigquery/v2/projects/test/jobs/JOBID","statistics":{"creationTime":"1785011395","endTime":"1785011395","query":{"statementType":"SELECT","totalBytesBilled":"1","totalBytesProcessed":"1"},"startTime":"1785011395","totalBytesProcessed":"1"},"status":{"state":"DONE"}}
+        \\{"configuration":{"jobType":"QUERY","query":{"destinationTable":{"datasetId":"_anon","projectId":"test","tableId":"ANONID"},"priority":"INTERACTIVE","query":"SELECT 1 AS col","useLegacySql":false}},"jobReference":{"jobId":"JOBID","projectId":"test"},"kind":"bigquery#job","selfLink":"http://0.0.0.0:19050/bigquery/v2/projects/test/jobs/JOBID","statistics":{"creationTime":"1785011395","endTime":"1785011395","query":{"statementType":"SELECT","totalBytesBilled":"1","totalBytesProcessed":"1"},"startTime":"1785011395","totalBytesProcessed":"1"},"status":{"state":"DONE"}}
     , out.items);
 }
 
@@ -218,6 +221,7 @@ test "the job resource parses and reports DONE" {
     try writeJobResource(arena, &out, .{
         .project_id = "p",
         .job_id = "j",
+        .destination_table_id = "anon",
         .sql = "SELECT 1",
         .endpoint = "h:1",
         .total_bytes = 0,
@@ -273,6 +277,7 @@ test "a DML job reports its statement type, affected rows and DML stats" {
         try writeJobResource(arena, &out, .{
             .project_id = "p",
             .job_id = "j",
+            .destination_table_id = "anon",
             .sql = "<statement>",
             .endpoint = "h:1",
             .total_bytes = 0,

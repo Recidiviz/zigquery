@@ -132,6 +132,10 @@ pub const Job = struct {
     arena: *std.heap.ArenaAllocator,
     project_id: []const u8,
     job_id: []const u8,
+    /// The table in the anonymous dataset that holds a query job's result, empty for other
+    /// kinds. Separate from job_id, which the client may choose: a table id has to pass
+    /// grpc/read_service.isSafeIdentifier.
+    destination_table_id: []const u8,
     /// The rows and schema, kept rather than a finished body: getQueryResults
     /// picks maxResults and formatOptions per request, and the request that
     /// ran the query cannot know either.
@@ -166,6 +170,7 @@ pub const JobStore = struct {
         project_id: []const u8,
         job_id: []const u8,
         kind: JobKind,
+        destination_table_id: []const u8,
         set: ResultSet,
         resource: []const u8,
     ) !void {
@@ -182,6 +187,7 @@ pub const JobStore = struct {
             .kind = kind,
             .project_id = try arena.dupe(u8, project_id),
             .job_id = try arena.dupe(u8, job_id),
+            .destination_table_id = try arena.dupe(u8, destination_table_id),
             .set = try set.cloneInto(arena),
             .resource = try arena.dupe(u8, resource),
         };
@@ -212,13 +218,9 @@ pub const JobStore = struct {
 
 /// Go server/util.go randomID: 27 alphanumeric characters.
 ///
-/// The first is a letter, where Go's may be a digit. A job id becomes a table
-/// id — the destination table's — and `grpc/read_service.isSafeIdentifier`
-/// requires a leading letter or underscore before it will quote a name into
-/// SQL, so a digit there made Storage reads of the destination fail with
-/// `MalformedTableName` for about one job in six. Narrowing the first character
-/// is the cheap end of that fix: job ids are opaque to clients, where relaxing
-/// the guard would weaken an injection check on a name the client supplies.
+/// The first is a letter, where Go's may be a digit: an anonymous destination table takes one
+/// of these as its id, and `grpc/read_service.isSafeIdentifier` requires a leading letter or
+/// underscore before it will quote a name into SQL.
 pub fn randomId(arena: std.mem.Allocator, rng: *std.Random.DefaultPrng) ![]const u8 {
     const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const alphabet = letters ++ "0123456789";
@@ -721,7 +723,7 @@ test "job store round-trips and replaces on duplicate id" {
     var types = [_]*spec.Type{&int_t};
     var names = [_][]const u8{"n"};
 
-    try store.put("test", "job1", .query, .{
+    try store.put("test", "job1", .query, "anon1", .{
         .names = &names,
         .types = &types,
         .cells = &.{.{ .int = 1 }},
@@ -733,7 +735,7 @@ test "job store round-trips and replaces on duplicate id" {
     try testing.expectEqualStrings("n", store.get("job1").?.set.names[0]);
     try testing.expect(store.get("job1").?.set.types[0] != &int_t);
 
-    try store.put("test", "job1", .query, .{
+    try store.put("test", "job1", .query, "anon1", .{
         .names = &names,
         .types = &types,
         .cells = &.{.{ .int = 2 }},
@@ -750,7 +752,7 @@ test "the job-rows lookup hands the virtual table what the job holds" {
     var str_t: spec.Type = .{ .kind = @backingInt(zigquery.pb.TypeKind.TYPE_STRING) };
     var types = [_]*spec.Type{&str_t};
     var names = [_][]const u8{"s"};
-    try store.put("test", "job2", .query, .{
+    try store.put("test", "job2", .query, "anon2", .{
         .names = &names,
         .types = &types,
         .cells = &.{ .{ .blob = "ab" }, .null },
