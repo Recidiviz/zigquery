@@ -4702,6 +4702,28 @@ test "ALTER TABLE shows through tables.get, keeping what the client posted for t
     ) != null);
 }
 
+test "a column ALTER TABLE renames keeps the description the client posted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    _ = try request(s, arena, .POST, "/projects/test/datasets/ds1/tables",
+        \\{"tableReference":{"projectId":"test","datasetId":"ds1","tableId":"renamed"},
+        \\ "schema":{"fields":[{"name":"name","type":"STRING","description":"who"}]}}
+    );
+    const q = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"ALTER TABLE `test.ds1.renamed` RENAME COLUMN name TO full_name"}
+    );
+    try testing.expectEqual(std.http.Status.ok, q.status);
+
+    const got = try request(s, arena, .GET, "/projects/test/datasets/ds1/tables/renamed", "");
+    try testing.expect(std.mem.indexOf(u8, got.body,
+        \\"schema":{"fields":[{"description":"who","name":"full_name","type":"STRING"}]}
+    ) != null);
+}
+
 test "tables.patch relaxes REQUIRED to NULLABLE, so a NULL inserts" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
