@@ -181,6 +181,8 @@ pub const OpenOptions = struct {
     /// null the connection owns a private catalog, which is what every
     /// single-connection caller wants and what all the tests use.
     shared_catalog: ?*shared_catalog.SharedCatalog = null,
+    /// Where a failed open or pragma records SQLite's reason.
+    failure: ?*sqlite.OpenFailure = null,
 };
 
 /// SQLite's own allocator accounting, process-wide and per-connection.
@@ -389,7 +391,7 @@ pub const Db = struct {
         errdefer gpa.destroy(db);
         db.* = .{
             .gpa = gpa,
-            .sqlite_db = try sqlite.Db.open(path),
+            .sqlite_db = try sqlite.Db.openReporting(path, opts.failure),
             .udf_state = undefined,
             .own_catalog = null,
             .shared = opts.shared_catalog,
@@ -399,7 +401,7 @@ pub const Db = struct {
         if (opts.busy_timeout_ms) |ms| db.sqlite_db.busyTimeout(ms);
         for (opts.pragmas) |pragma| {
             db.sqlite_db.exec(pragma) catch {
-                db.setLastSqliteError();
+                if (opts.failure) |f| f.record(&db.sqlite_db);
                 return error.ExecFailed;
             };
         }
@@ -7242,6 +7244,29 @@ test "openWith applies pragmas and leaves open() behaviour unchanged" {
     var rows = try db.rawQuery("PRAGMA journal_mode", &.{});
     defer rows.deinit();
     try testing.expectEqualStrings("wal", (try rows.next()).?[0].text);
+}
+
+test "openWith records the reason a pragma refused the file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "junk.db", .data = "not a database at all" });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const db_path = try std.fmt.allocPrintSentinel(
+        arena_state.allocator(),
+        ".zig-cache/tmp/{s}/junk.db",
+        .{tmp.sub_path},
+        0,
+    );
+
+    var failure: sqlite.OpenFailure = .{};
+    try testing.expectError(error.ExecFailed, Db.openWith(testing.allocator, db_path, .{
+        .pragmas = &.{"PRAGMA journal_mode = WAL"},
+        .failure = &failure,
+    }));
+    try testing.expectEqual(sqlite.c.SQLITE_NOTADB, failure.code);
+    try testing.expectEqualStrings("file is not a database", failure.message());
 }
 
 test "rawQuery round-trips values and stays invisible to the analyzer" {

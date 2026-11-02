@@ -76,6 +76,52 @@ pub fn memStatsEnabled() bool {
     return memStatsRequested();
 }
 
+/// Why a connection could not open its file: SQLite's extended result code and message, and
+/// the OS errno behind them when the error came from the file system.
+pub const OpenFailure = struct {
+    code: c_int = c.SQLITE_OK,
+    errno: c_int = 0,
+    msg_buf: [256]u8 = undefined,
+    msg_len: usize = 0,
+
+    /// A message past 256 bytes is truncated.
+    pub fn init(code: c_int, errno: c_int, message_text: []const u8) OpenFailure {
+        var f: OpenFailure = .{ .code = code, .errno = errno };
+        f.msg_len = @min(message_text.len, f.msg_buf.len);
+        @memcpy(f.msg_buf[0..f.msg_len], message_text[0..f.msg_len]);
+        return f;
+    }
+
+    /// The connection's most recent error.
+    pub fn record(f: *OpenFailure, db: *Db) void {
+        f.capture(db.handle);
+    }
+
+    fn capture(f: *OpenFailure, h: *c.sqlite3) void {
+        const code = c.sqlite3_extended_errcode(h);
+        // The errno of SQLite's last OS call, which belongs to this error only for these codes.
+        const errno = switch (code & 0xff) {
+            c.SQLITE_CANTOPEN,
+            c.SQLITE_IOERR,
+            c.SQLITE_READONLY,
+            c.SQLITE_PERM,
+            => c.sqlite3_system_errno(h),
+            else => 0,
+        };
+        f.* = .init(code, errno, std.mem.sliceTo(c.sqlite3_errmsg(h), 0));
+    }
+
+    pub fn message(f: *const OpenFailure) []const u8 {
+        return f.msg_buf[0..f.msg_len];
+    }
+
+    /// The errno's symbolic name without its `E` prefix, e.g. "ACCES".
+    pub fn errnoName(f: *const OpenFailure) ?[]const u8 {
+        if (f.errno <= 0 or f.errno > std.math.maxInt(u16)) return null;
+        return std.enums.tagName(std.posix.E, @fromBackingInt(@intCast(f.errno)));
+    }
+};
+
 pub const Db = struct {
     handle: *c.sqlite3,
 
@@ -93,12 +139,20 @@ pub const Db = struct {
     /// only when asked, where sqlite3_open relied on the library being built
     /// with SQLITE_USE_URI.
     pub fn open(path: [:0]const u8) Error!Db {
+        return openReporting(path, null);
+    }
+
+    /// open(), recording why it failed in `failure`.
+    pub fn openReporting(path: [:0]const u8, failure: ?*OpenFailure) Error!Db {
         configureOnce();
         var handle: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE |
             c.SQLITE_OPEN_URI | c.SQLITE_OPEN_NOMUTEX;
         if (c.sqlite3_open_v2(path.ptr, &handle, flags, null) != c.SQLITE_OK) {
-            if (handle) |h| _ = c.sqlite3_close_v2(h);
+            if (handle) |h| {
+                if (failure) |f| f.capture(h);
+                _ = c.sqlite3_close_v2(h);
+            }
             return error.SQLite;
         }
         return .{ .handle = handle.? };
@@ -786,4 +840,39 @@ test "open, query, scalar UDF, aggregate, collation" {
         try std.testing.expect(try stmt.step());
         try std.testing.expectEqual(@as(i64, 6), stmt.columnInt64(0));
     }
+}
+
+test "openReporting records why a file cannot be opened" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+
+    const missing_dir = try std.fmt.bufPrintSentinel(
+        &buf,
+        ".zig-cache/tmp/{s}/no-such-dir/x.db",
+        .{tmp.sub_path},
+        0,
+    );
+    var failure: OpenFailure = .{};
+    try std.testing.expectError(error.SQLite, Db.openReporting(missing_dir, &failure));
+    try std.testing.expectEqual(c.SQLITE_CANTOPEN, failure.code & 0xff);
+    try std.testing.expectEqualStrings("unable to open database file", failure.message());
+    try std.testing.expectEqualStrings("NOENT", failure.errnoName().?);
+
+    const dir_itself = try std.fmt.bufPrintSentinel(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    failure = .{};
+    try std.testing.expectError(error.SQLite, Db.openReporting(dir_itself, &failure));
+    try std.testing.expectEqualStrings("ISDIR", failure.errnoName().?);
+}
+
+test "OpenFailure.record keeps a statement's error and names no errno for it" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try std.testing.expectError(error.SQLite, db.exec("SELECT * FROM no_such_table"));
+
+    var failure: OpenFailure = .{};
+    failure.record(&db);
+    try std.testing.expectEqual(c.SQLITE_ERROR, failure.code);
+    try std.testing.expectEqualStrings("no such table: no_such_table", failure.message());
+    try std.testing.expectEqual(@as(?[]const u8, null), failure.errnoName());
 }

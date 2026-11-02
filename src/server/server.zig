@@ -53,6 +53,53 @@ fn nowSeed() u64 {
     return @bitCast(@as(i64, @intCast(tv.sec)) *% 1_000_000 +% @as(i64, @intCast(tv.usec)));
 }
 
+/// One line saying why `--database` could not be opened. `euid` is named when the OS refused
+/// access, since a container's user is the usual cause.
+const OpenFailureReport = struct {
+    path: []const u8,
+    err: anyerror,
+    failure: *const zigquery.sqlite.OpenFailure,
+    euid: std.c.uid_t,
+
+    pub fn format(r: OpenFailureReport, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("cannot open --database={s}: ", .{r.path});
+        if (r.err == error.IncompatibleStorageFormat) {
+            return w.writeAll("written in a storage format this build does not read; " ++
+                "point --database at a new file");
+        }
+        const c = zigquery.sqlite.c;
+        if (r.failure.code == c.SQLITE_OK) return w.print("{t}", .{r.err});
+        try w.writeAll(r.failure.message());
+        if (r.failure.errnoName()) |name| try w.print(" (errno {s})", .{name});
+        const E = std.posix.E;
+        const denied = r.failure.errno == @backingInt(E.ACCES) or
+            r.failure.errno == @backingInt(E.PERM) or
+            r.failure.code & 0xff == c.SQLITE_READONLY;
+        if (denied) {
+            try w.print("; uid {d} needs write access to the file and its directory", .{r.euid});
+        }
+    }
+};
+
+/// SQLite retries a refused read-write open read-only, so a missing file in a directory this
+/// process cannot write reports the retry's NOENT. Names the directory's refusal instead.
+fn blameUnwritableDirectory(
+    io: std.Io,
+    path: []const u8,
+    failure: *zigquery.sqlite.OpenFailure,
+) void {
+    const E = std.posix.E;
+    if (failure.errno != @backingInt(E.NOENT)) return;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    std.Io.Dir.cwd().access(io, dir, .{ .write = true }) catch |err| switch (err) {
+        error.AccessDenied => failure.errno = @backingInt(E.ACCES),
+        error.PermissionDenied => failure.errno = @backingInt(E.PERM),
+        error.ReadOnlyFileSystem => failure.errno = @backingInt(E.ROFS),
+        // The directory is missing too, or cannot be inspected: NOENT stands.
+        else => {},
+    };
+}
+
 /// Wall clock in milliseconds, for the deadlines an upload session carries.
 fn nowMillis() i64 {
     return @divFloor(@as(i64, @bitCast(nowSeed())), 1_000);
@@ -128,10 +175,21 @@ pub const Server = struct {
         s.endpoint = try std.fmt.allocPrint(arena, "{s}:{d}", .{ opts.host, opts.port });
 
         const store = try storage_mod.Storage.resolve(arena, opts.database);
-        s.db = try driver.Db.openWith(gpa, store.dsn, .{
+        var failure: zigquery.sqlite.OpenFailure = .{};
+        s.db = driver.Db.openWith(gpa, store.dsn, .{
             .pragmas = store.pragmas(),
             .busy_timeout_ms = 5000,
-        });
+            .failure = &failure,
+        }) catch |err| {
+            if (opts.database) |path| blameUnwritableDirectory(io, path, &failure);
+            std.log.err("{f}", .{OpenFailureReport{
+                .path = opts.database orelse ":memory:",
+                .err = err,
+                .failure = &failure,
+                .euid = std.c.geteuid(),
+            }});
+            return err;
+        };
         // Until a job runs, DDL that names only `dataset.table` means this
         // project; each job then sets its own.
         s.db.default_project = s.project;
@@ -3305,6 +3363,79 @@ test "patched dataset fields round-trip through get and list, which is ordered b
     // Patching an undeclared dataset is a miss.
     const missing = try request(s, arena, .PATCH, "/projects/test/datasets/c_ds", "{}");
     try testing.expectEqual(std.http.Status.not_found, missing.status);
+}
+
+fn expectOpenFailure(
+    expected: []const u8,
+    err: anyerror,
+    failure: zigquery.sqlite.OpenFailure,
+) !void {
+    var buf: [512]u8 = undefined;
+    const report: OpenFailureReport = .{
+        .path = "/data/bq.db",
+        .err = err,
+        .failure = &failure,
+        .euid = 65532,
+    };
+    try testing.expectEqualStrings(expected, try std.fmt.bufPrint(&buf, "{f}", .{report}));
+}
+
+test "OpenFailureReport names the file, SQLite's reason and the errno" {
+    const c = zigquery.sqlite.c;
+    const E = std.posix.E;
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: unable to open database file (errno ACCES); " ++
+            "uid 65532 needs write access to the file and its directory",
+        error.SQLite,
+        .init(c.SQLITE_CANTOPEN, @backingInt(E.ACCES), "unable to open database file"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: unable to open database file (errno NOENT)",
+        error.SQLite,
+        .init(c.SQLITE_CANTOPEN, @backingInt(E.NOENT), "unable to open database file"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: file is not a database",
+        error.ExecFailed,
+        .init(c.SQLITE_NOTADB, 0, "file is not a database"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: attempt to write a readonly database; " ++
+            "uid 65532 needs write access to the file and its directory",
+        error.ExecFailed,
+        .init(c.SQLITE_READONLY, 0, "attempt to write a readonly database"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: written in a storage format this build " ++
+            "does not read; point --database at a new file",
+        error.IncompatibleStorageFormat,
+        .{},
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: OutOfMemory",
+        error.OutOfMemory,
+        .{},
+    );
+}
+
+test "blameUnwritableDirectory names the directory a missing file could not be created in" {
+    const c = zigquery.sqlite.c;
+    const E = std.posix.E;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "locked", .fromMode(0o555));
+    var buf: [256]u8 = undefined;
+
+    const in_missing = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/absent/x.db", .{tmp.sub_path});
+    var failure: zigquery.sqlite.OpenFailure = .init(c.SQLITE_CANTOPEN, @backingInt(E.NOENT), "");
+    blameUnwritableDirectory(testing.io, in_missing, &failure);
+    try testing.expectEqualStrings("NOENT", failure.errnoName().?);
+
+    // Root may write anywhere, so only another user sees the directory refuse.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const in_locked = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/locked/x.db", .{tmp.sub_path});
+    blameUnwritableDirectory(testing.io, in_locked, &failure);
+    try testing.expectEqualStrings("ACCES", failure.errnoName().?);
 }
 
 test "declared datasets survive a restart on a file-backed database" {

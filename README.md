@@ -35,6 +35,13 @@ Options:
   -h, --help              show this help and exit
 ```
 
+To keep data across restarts, mount a volume at `/data`, which the image's `nonroot` user owns:
+
+```
+docker run -p 9050:9050 -v zigquery-data:/data ghcr.io/recidiviz/zigquery:latest \
+  --project=my-project --database=/data/bigquery.db
+```
+
 ## Development
 
 [See docs/BUILD.md](./docs/BUILD.md) for environment setup and build commands.
