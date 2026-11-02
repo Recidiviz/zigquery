@@ -13,6 +13,7 @@ import { after, before, test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { BigQuery } from '@google-cloud/bigquery';
+import { PassThroughClient } from 'google-auth-library';
 
 import { KNOWN_FAILURES } from './known_failures.mjs';
 
@@ -105,6 +106,9 @@ export function useEmulator() {
       projectId: PROJECT_ID,
       apiEndpoint: emulator.url,
       autoRetry: false,
+      // Sends requests without credentials, so the suite never reads the machine's
+      // Application Default Credentials.
+      authClient: new PassThroughClient(),
     });
   });
   after(() => stop());

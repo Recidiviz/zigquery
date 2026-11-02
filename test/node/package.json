@@ -9,6 +9,7 @@
     "test": "node --test --test-concurrency=4"
   },
   "dependencies": {
-    "@google-cloud/bigquery": "9.5.0"
+    "@google-cloud/bigquery": "9.5.0",
+    "google-auth-library": "11.3.1"
   }
 }
