@@ -147,6 +147,7 @@ pub const Server = struct {
     /// Host:port, for the selfLink-style URLs handlers build.
     endpoint: []const u8,
 
+    /// error.DatabaseOpenFailed means `opts.database` could not be opened, and the log says why.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Server {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
@@ -186,7 +187,7 @@ pub const Server = struct {
                 .failure = &failure,
                 .euid = std.c.geteuid(),
             }});
-            return err;
+            return error.DatabaseOpenFailed;
         };
         // Until a job runs, DDL that names only `dataset.table` means this
         // project; each job then sets its own.

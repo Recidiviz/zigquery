@@ -111,14 +111,17 @@ pub fn main(init: std.process.Init) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var app = try bqserver.Server.init(gpa, io, .{
+    var app = bqserver.Server.init(gpa, io, .{
         .project = opts.project.?,
         .database = opts.database,
         .host = opts.host,
         .port = opts.port,
         .data_from_json = json_paths.items,
         .dataset = opts.dataset,
-    });
+    }) catch |err| switch (err) {
+        error.DatabaseOpenFailed => std.process.exit(1),
+        else => return err,
+    };
     defer app.deinit();
 
     var server = try http_server.Server.listen(gpa, io, .{
