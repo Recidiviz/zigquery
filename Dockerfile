@@ -26,8 +26,7 @@ FROM base
 
 COPY dist/bin/ /usr/local/bin/
 # /data owned by nonroot, so a fresh named volume mounted there for --database is writable.
-# The base's empty home directory is the source: distroless has no shell to mkdir with, and
-# COPY --chown sets the owner under every builder, which WORKDIR does not.
+# Distroless has no shell, so the base's empty home directory is copied with --chown.
 COPY --from=base --chown=nonroot:nonroot /home/nonroot /data
 # The binaries statically link the libraries THIRD_PARTY_NOTICES lists, and
 # their licenses require the notices to ship with them.

@@ -80,12 +80,12 @@ pub fn memStatsEnabled() bool {
 /// the OS errno behind them when the error came from the file system.
 pub const OpenFailure = struct {
     code: c_int = c.SQLITE_OK,
-    errno: c_int = 0,
+    errno: std.posix.E = .SUCCESS,
     msg_buf: [256]u8 = undefined,
     msg_len: usize = 0,
 
     /// A message past 256 bytes is truncated.
-    pub fn init(code: c_int, errno: c_int, message_text: []const u8) OpenFailure {
+    pub fn init(code: c_int, errno: std.posix.E, message_text: []const u8) OpenFailure {
         var f: OpenFailure = .{ .code = code, .errno = errno };
         f.msg_len = @min(message_text.len, f.msg_buf.len);
         @memcpy(f.msg_buf[0..f.msg_len], message_text[0..f.msg_len]);
@@ -100,15 +100,27 @@ pub const OpenFailure = struct {
     fn capture(f: *OpenFailure, h: *c.sqlite3) void {
         const code = c.sqlite3_extended_errcode(h);
         // The errno of SQLite's last OS call, which belongs to this error only for these codes.
-        const errno = switch (code & 0xff) {
+        const errno: std.posix.E = switch (primary(code)) {
             c.SQLITE_CANTOPEN,
             c.SQLITE_IOERR,
             c.SQLITE_READONLY,
             c.SQLITE_PERM,
-            => c.sqlite3_system_errno(h),
-            else => 0,
+            => if (std.math.cast(u16, c.sqlite3_system_errno(h))) |n|
+                @fromBackingInt(n)
+            else
+                .SUCCESS,
+            else => .SUCCESS,
         };
         f.* = .init(code, errno, std.mem.sliceTo(c.sqlite3_errmsg(h), 0));
+    }
+
+    /// The primary result code, e.g. SQLITE_CANTOPEN for SQLITE_CANTOPEN_ISDIR.
+    pub fn primaryCode(f: *const OpenFailure) c_int {
+        return primary(f.code);
+    }
+
+    fn primary(code: c_int) c_int {
+        return code & 0xff;
     }
 
     pub fn message(f: *const OpenFailure) []const u8 {
@@ -117,8 +129,8 @@ pub const OpenFailure = struct {
 
     /// The errno's symbolic name without its `E` prefix, e.g. "ACCES".
     pub fn errnoName(f: *const OpenFailure) ?[]const u8 {
-        if (f.errno <= 0 or f.errno > std.math.maxInt(u16)) return null;
-        return std.enums.tagName(std.posix.E, @fromBackingInt(@intCast(f.errno)));
+        if (f.errno == .SUCCESS) return null;
+        return std.enums.tagName(std.posix.E, f.errno);
     }
 };
 
@@ -855,7 +867,7 @@ test "openReporting records why a file cannot be opened" {
     );
     var failure: OpenFailure = .{};
     try std.testing.expectError(error.SQLite, Db.openReporting(missing_dir, &failure));
-    try std.testing.expectEqual(c.SQLITE_CANTOPEN, failure.code & 0xff);
+    try std.testing.expectEqual(c.SQLITE_CANTOPEN, failure.primaryCode());
     try std.testing.expectEqualStrings("unable to open database file", failure.message());
     try std.testing.expectEqualStrings("NOENT", failure.errnoName().?);
 
@@ -874,5 +886,5 @@ test "OpenFailure.record keeps a statement's error and names no errno for it" {
     failure.record(&db);
     try std.testing.expectEqual(c.SQLITE_ERROR, failure.code);
     try std.testing.expectEqualStrings("no such table: no_such_table", failure.message());
-    try std.testing.expectEqual(@as(?[]const u8, null), failure.errnoName());
+    try std.testing.expect(failure.errnoName() == null);
 }
