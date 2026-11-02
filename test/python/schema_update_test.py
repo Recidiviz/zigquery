@@ -79,3 +79,23 @@ class TestSchemaUpdates(BigQueryEmulatorTestCase):
             " Field b is missing in new schema",
             raised.exception.message,
         )
+
+    def test_alter_table_add_and_drop_column(self) -> None:
+        address = BigQueryAddress(dataset_id=_DATASET, table_id="altered")
+        self.create_mock_table(
+            address, schema=[SchemaField("a", "INTEGER"), SchemaField("b", "STRING")]
+        )
+        self.client.query(
+            f"ALTER TABLE `{self._name('altered')}` ADD COLUMN c DATE, DROP COLUMN b"
+        ).result()
+        table = self.client.get_table(self._name("altered"))
+        self.assertEqual(
+            [("a", "INTEGER"), ("c", "DATE")],
+            [(field.name, field.field_type) for field in table.schema],
+        )
+
+        with self.assertRaises(exceptions.BadRequest) as raised:
+            self.client.query(
+                f"ALTER TABLE `{self._name('altered')}` DROP COLUMN a, DROP COLUMN c"
+            ).result()
+        self.assertIn("Cannot DROP last column from the table.", raised.exception.message)

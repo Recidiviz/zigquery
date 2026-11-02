@@ -244,6 +244,7 @@ pub const StatementType = enum {
     drop_view,
     drop_function,
     drop_row_access_policy,
+    alter_table,
     begin_transaction,
     commit_transaction,
     /// More than one statement in one call.
@@ -269,6 +270,7 @@ pub const StatementType = enum {
         .drop_view = "DROP_VIEW",
         .drop_function = "DROP_FUNCTION",
         .drop_row_access_policy = "DROP_ROW_ACCESS_POLICY",
+        .alter_table = "ALTER_TABLE",
         .begin_transaction = "BEGIN_TRANSACTION",
         .commit_transaction = "COMMIT_TRANSACTION",
         .script = "SCRIPT",
@@ -845,12 +847,10 @@ pub const Db = struct {
     pub fn changeTableColumns(
         db: *Db,
         arena: std.mem.Allocator,
-        project_id: []const u8,
-        dataset_id: []const u8,
-        table_id: []const u8,
+        name_path: []const []const u8,
         change: TableColumnsChange,
     ) Error!void {
-        const current = (try db.catalogTable(arena, project_id, dataset_id, table_id)) orelse {
+        const current = (try db.persistentTable(arena, name_path)) orelse {
             db.setLastError("table not found");
             return error.ExecFailed;
         };
@@ -951,6 +951,152 @@ pub const Db = struct {
         ), &.{});
         try db.execPkIndex(arena, updated);
     }
+
+    /// ALTER TABLE ... ADD COLUMN / DROP COLUMN, every action at once, as BigQuery applies them.
+    /// The analyzer has already refused a column added twice, one added and dropped, and one
+    /// added or dropped that does or does not exist; what is left are BigQuery's own rules.
+    /// data-definition-language.md#alter
+    fn execAlterTable(
+        db: *Db,
+        arena: std.mem.Allocator,
+        alter: *const pb.ResolvedAlterTableStmtProto,
+    ) Error!void {
+        const object = alter.parent orelse return error.TransformFailed;
+        if (object.is_if_exists orelse false) {
+            return db.fail("ALTER TABLE with schema changes does not support IF EXISTS clause");
+        }
+        const path = try db.qualifyPath(arena, object.name_path);
+        const current = (try db.persistentTable(arena, path)) orelse {
+            const name = try std.mem.join(arena, ".", path);
+            return db.failFmt(arena, "Not found: Table {s}", .{name});
+        };
+        const table_id = path[path.len - 1];
+        if (current.is_view) {
+            const message = "ALTER TABLE does not support modifying the schema of a(n) VIEW: {s}";
+            return db.failFmt(arena, message, .{table_id});
+        }
+        var alter_columns: AlterColumns = .{ .arena = arena, .table = current };
+        for (current.columns, 0..) |col, i| {
+            try alter_columns.layout.append(arena, .{ .column = col, .from = @intCast(i) });
+        }
+        for (object.alter_action_list) |action_any| {
+            const action = action_any.node orelse return error.TransformFailed;
+            alter_columns.apply(action) catch |err| switch (err) {
+                error.Refused => return db.fail(alter_columns.refusal),
+                else => |e| return e,
+            };
+        }
+        if (alter_columns.layout.items.len == 0) {
+            const message = "Cannot DROP last column from the table. " ++
+                "Table should at least have one column.";
+            return db.fail(message);
+        }
+        try db.changeTableColumns(arena, path, .{ .layout = alter_columns.layout.items });
+    }
+
+    /// The persistent table or view registered under exactly `name_path`, or null.
+    fn persistentTable(
+        db: *Db,
+        arena: std.mem.Allocator,
+        name_path: []const []const u8,
+    ) error{OutOfMemory}!?*const spec.TableSpec {
+        const canonical = try formatNamePath(arena, name_path);
+        var g = db.lockCatalog();
+        defer g.unlock();
+        const found = g.catalog.tableSpecByName(canonical) orelse return null;
+        if (found.name_path.len != name_path.len) return null;
+        for (found.name_path, name_path) |a, b| {
+            if (!std.mem.eql(u8, a, b)) return null;
+        }
+        return found;
+    }
+
+    /// Sets `lastError` and fails the statement.
+    fn fail(db: *Db, message: []const u8) Error {
+        db.setLastError(message);
+        return error.ExecFailed;
+    }
+
+    fn failFmt(db: *Db, arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Error {
+        return db.fail(try std.fmt.allocPrint(arena, fmt, args));
+    }
+
+    /// The columns of a table under ALTER TABLE, as its actions so far leave them.
+    const AlterColumns = struct {
+        arena: std.mem.Allocator,
+        table: *const spec.TableSpec,
+        layout: std.ArrayList(column_change.ColumnChange) = .empty,
+        /// BigQuery's message, once an action is refused.
+        refusal: []const u8 = "",
+
+        const ApplyError = Error || error{Refused};
+
+        fn apply(
+            a: *AlterColumns,
+            action: pb.AnyResolvedAlterActionProto.NodeUnion,
+        ) ApplyError!void {
+            switch (action) {
+                .resolved_add_column_action_node => |action_add| try a.add(action_add),
+                .resolved_drop_column_action_node => |action_drop| try a.drop(action_drop),
+                else => return a.refuse("ALTER TABLE {s} is not supported", .{alterActionName(action)}),
+            }
+        }
+
+        fn add(a: *AlterColumns, action: *const pb.ResolvedAddColumnActionProto) ApplyError!void {
+            const def = action.column_definition orelse return error.TransformFailed;
+            const name = def.name orelse return error.TransformFailed;
+            if (a.find(name) != null) return;
+            if (def.default_value) |default| {
+                const sql = default.sql orelse "";
+                const message = "Add field with default value to an existing table schema is not " ++
+                    "supported; Field: {s}. You can achieve the same result by executing the " ++
+                    "following 3 statements: \n1. ALTER TABLE my_table ADD COLUMN {s}; \n" ++
+                    "2. ALTER TABLE my_table ALTER COLUMN {s} SET DEFAULT {s}; \n" ++
+                    "3. UPDATE my_table SET {s} = {s} WHERE TRUE; \n";
+                return a.refuse(message, .{ name, name, name, sql, name, sql });
+            }
+            const required = "Cannot add required fields to an existing schema. (field: {s})";
+            const columns = try columnSpecsFromDefs(a.arena, &.{@constCast(def)});
+            if (columns[0].is_not_null) return a.refuse(required, .{name});
+            try a.layout.append(a.arena, .{ .column = columns[0] });
+        }
+
+        fn drop(a: *AlterColumns, action: *const pb.ResolvedDropColumnActionProto) ApplyError!void {
+            const name = action.name orelse return error.TransformFailed;
+            const index = a.find(name) orelse return;
+            if (try a.isLayoutColumn(name)) {
+                const message = "Column `{s}` cannot be dropped in table `{s}`. Columns used in " ++
+                    "table partitioning or clustering or as part of key constraints cannot be dropped.";
+                const table_id = a.table.name_path[a.table.name_path.len - 1];
+                return a.refuse(message, .{ name, table_id });
+            }
+            _ = a.layout.orderedRemove(index);
+        }
+
+        /// Whether `name` partitions or clusters the table, or is part of its primary key, by DDL
+        /// or by the metadata API's resource.
+        fn isLayoutColumn(a: *const AlterColumns, name: []const u8) error{OutOfMemory}!bool {
+            const t = a.table;
+            if (t.partitioning) |partitioning| switch (partitioning) {
+                inline else => |p| if (std.ascii.eqlIgnoreCase(p.field, name)) return true,
+            };
+            if (containsIgnoreCase(t.clustering, name)) return true;
+            if (containsIgnoreCase(t.primary_key, name)) return true;
+            return metadataNamesColumn(a.arena, t.metadata, name);
+        }
+
+        fn find(a: *const AlterColumns, name: []const u8) ?usize {
+            for (a.layout.items, 0..) |change, i| {
+                if (std.ascii.eqlIgnoreCase(change.column.name, name)) return i;
+            }
+            return null;
+        }
+
+        fn refuse(a: *AlterColumns, comptime fmt: []const u8, args: anytype) ApplyError {
+            a.refusal = try std.fmt.allocPrint(a.arena, fmt, args);
+            return error.Refused;
+        }
+    };
 
     /// The columns a `CREATE TABLE` column list declares, as the analyzer resolves them, for a
     /// schema that arrives as text rather than as a statement.
@@ -1993,6 +2139,13 @@ pub const Db = struct {
                 try db.execTruncateStatement(arena, truncate_stmt);
                 return .{};
             },
+            .resolved_alter_object_stmt_node => |alter_any| {
+                switch (alter_any.node orelse return error.Unimplemented) {
+                    .resolved_alter_table_stmt_node => |alter| try db.execAlterTable(arena, alter),
+                    else => return error.Unimplemented,
+                }
+                return .{};
+            },
             // Unsupported but implemented as no-ops
             .resolved_begin_stmt_node,
             .resolved_commit_stmt_node,
@@ -2344,12 +2497,20 @@ pub const Db = struct {
     ) Error!usize {
         const base = ct.parent orelse return error.TransformFailed;
         const create = base.parent orelse return error.TransformFailed;
+        try db.refuseColumnDefaults(base);
         const table_spec = try newTableSpecFromCreate(arena, create, base, "", .{
             .partition_by = ct.partition_by_list,
             .cluster_by = ct.cluster_by_list,
             .columns = try columnNamesFromDefinitions(arena, base.column_definition_list),
         });
         return db.execCreateTableAction(arena, table_spec, args);
+    }
+
+    /// A column DEFAULT, which the engine does not apply, fails the CREATE.
+    fn refuseColumnDefaults(db: *Db, base: *const pb.ResolvedCreateTableStmtBaseProto) Error!void {
+        for (base.column_definition_list) |def| {
+            if (def.default_value != null) return db.fail("Column DEFAULT value is not supported.");
+        }
     }
 
     /// CREATE TABLE AS SELECT: the transformer yields a CreateTableStatement
@@ -2373,6 +2534,7 @@ pub const Db = struct {
 
         const base = ctas.parent orelse return error.TransformFailed;
         const create = base.parent orelse return error.TransformFailed;
+        try db.refuseColumnDefaults(base);
         const table_spec = try newTableSpecFromCreate(arena, create, base, query_str, .{
             .partition_by = ctas.partition_by_list,
             .cluster_by = ctas.cluster_by_list,
@@ -3501,6 +3663,7 @@ fn statementTypeOf(stmt_node: pb.AnyResolvedStatementProto.NodeUnion) ?Statement
     return switch (stmt_node) {
         .resolved_create_statement_node => |create_any| createStatementTypeOf(create_any),
         .resolved_drop_stmt_node => |drop_stmt| dropStatementTypeOf(drop_stmt),
+        .resolved_alter_object_stmt_node => |alter_any| alterStatementTypeOf(alter_any),
         else => node_statement_types.get(stmt_node),
     };
 }
@@ -3522,6 +3685,14 @@ const node_statement_types = std.enums.EnumMap(
     .resolved_create_row_access_policy_stmt_node = .create_row_access_policy,
     .resolved_drop_row_access_policy_stmt_node = .drop_row_access_policy,
 });
+
+/// The ALTER kinds `Db.runStatements` executes.
+fn alterStatementTypeOf(alter_any: *const pb.AnyResolvedAlterObjectStmtProto) ?StatementType {
+    return switch (alter_any.node orelse return null) {
+        .resolved_alter_table_stmt_node => .alter_table,
+        else => null,
+    };
+}
 
 /// The DROP kinds `Db.execDropStatement` executes.
 fn dropStatementTypeOf(drop_stmt: *const pb.ResolvedDropStmtProto) ?StatementType {
@@ -3597,6 +3768,80 @@ fn functionArgumentSpecType(
 }
 
 /// ColumnSpecs from the resolved column definition list: type, NOT NULL, OPTIONS(description).
+/// An ALTER TABLE action as its statement spells it, for the refusal of one this engine does
+/// not run.
+fn alterActionName(action: pb.AnyResolvedAlterActionProto.NodeUnion) []const u8 {
+    return switch (action) {
+        .resolved_set_options_action_node => "SET OPTIONS",
+        .resolved_rename_to_action_node => "RENAME TO",
+        .resolved_rename_column_action_node => "RENAME COLUMN",
+        .resolved_alter_column_action_node => "ALTER COLUMN",
+        .resolved_add_constraint_action_node => "ADD CONSTRAINT",
+        .resolved_drop_constraint_action_node => "DROP CONSTRAINT",
+        .resolved_drop_primary_key_action_node => "DROP PRIMARY KEY",
+        .resolved_set_collate_clause_node => "SET DEFAULT COLLATE",
+        else => "with this action",
+    };
+}
+
+fn containsIgnoreCase(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(n, name)) return true;
+    }
+    return false;
+}
+
+/// Whether the metadata API's resource partitions or clusters a table by `name`, or keys it on
+/// `name`: `timePartitioning.field`, `rangePartitioning.field`, `clustering.fields` or
+/// `tableConstraints.primaryKey.columns`.
+/// https://cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
+fn metadataNamesColumn(
+    arena: std.mem.Allocator,
+    metadata: []const u8,
+    name: []const u8,
+) error{OutOfMemory}!bool {
+    if (metadata.len == 0) return false;
+    const resource = std.json.parseFromSliceLeaky(std.json.Value, arena, metadata, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+    const paths = [_][]const []const u8{
+        &.{ "timePartitioning", "field" },
+        &.{ "rangePartitioning", "field" },
+        &.{ "clustering", "fields" },
+        &.{ "tableConstraints", "primaryKey", "columns" },
+    };
+    for (paths) |path| {
+        if (jsonNamesColumn(jsonAt(resource, path), name)) return true;
+    }
+    return false;
+}
+
+fn jsonAt(root: std.json.Value, path: []const []const u8) ?std.json.Value {
+    var v = root;
+    for (path) |key| {
+        if (v != .object) return null;
+        v = v.object.get(key) orelse return null;
+    }
+    return v;
+}
+
+/// Whether a resource member, a column name or an array of them, names `name`.
+fn jsonNamesColumn(member: ?std.json.Value, name: []const u8) bool {
+    const v = member orelse return false;
+    switch (v) {
+        .string => |s| return std.ascii.eqlIgnoreCase(s, name),
+        .array => |names| {
+            for (names.items) |item| {
+                if (item == .string and std.ascii.eqlIgnoreCase(item.string, name)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 fn columnSpecsFromDefs(
     arena: std.mem.Allocator,
     defs: []const *pb.ResolvedColumnDefinitionProto,

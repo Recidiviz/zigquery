@@ -947,9 +947,75 @@ pub const Server = struct {
         table_spec: *const zigquery.spec.TableSpec,
     ) !?std.json.Value {
         if (try postedOf(arena, table_spec)) |posted| {
-            if (posted.object.get("schema")) |schema| return schema;
+            if (posted.object.get("schema")) |schema| {
+                return try reconcileSchema(arena, schema, table_spec);
+            }
         }
         return schemaJsonFromSpec(arena, table_spec);
+    }
+
+    /// A table's posted schema, field by field, for the columns it has now. A column the posted
+    /// schema does not name, one that ALTER TABLE added, takes the field its catalog spec renders,
+    /// and a posted field for a column ALTER TABLE dropped is left out. A view's schema, and a
+    /// posted schema with no fields, stand as posted.
+    fn reconcileSchema(
+        arena: std.mem.Allocator,
+        schema: std.json.Value,
+        table_spec: *const zigquery.spec.TableSpec,
+    ) !std.json.Value {
+        if (table_spec.is_view) return schema;
+        const posted_fields = fieldsOf(schema) orelse return schema;
+        if (posted_fields.len == 0) return schema;
+        if (namesColumns(posted_fields, table_spec.columns)) return schema;
+        var fields: std.json.Array = .init(arena);
+        for (table_spec.columns) |col| {
+            try fields.append(postedField(posted_fields, col.name) orelse
+                try fieldJsonFromColumn(arena, col));
+        }
+        var reconciled: std.json.ObjectMap = .empty;
+        var it = schema.object.iterator();
+        while (it.next()) |kv| try reconciled.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+        try reconciled.put(arena, "fields", .{ .array = fields });
+        return .{ .object = reconciled };
+    }
+
+    /// Whether `fields` names exactly `columns`, in order.
+    fn namesColumns(
+        fields: []const std.json.Value,
+        columns: []const *zigquery.spec.ColumnSpec,
+    ) bool {
+        if (fields.len != columns.len) return false;
+        for (fields, columns) |field, col| {
+            if (!std.mem.eql(u8, fieldName(field), col.name)) return false;
+        }
+        return true;
+    }
+
+    fn postedField(fields: []const std.json.Value, name: []const u8) ?std.json.Value {
+        for (fields) |field| {
+            if (std.mem.eql(u8, fieldName(field), name)) return field;
+        }
+        return null;
+    }
+
+    fn fieldName(field: std.json.Value) []const u8 {
+        if (field != .object) return "";
+        const name = field.object.get("name") orelse return "";
+        return if (name == .string) name.string else "";
+    }
+
+    fn fieldJsonFromColumn(
+        arena: std.mem.Allocator,
+        col: *const zigquery.spec.ColumnSpec,
+    ) !std.json.Value {
+        var out: std.ArrayList(u8) = .empty;
+        try schema_mod.writeFieldMode(arena, &out, .{
+            .name = col.name,
+            .type = col.type,
+            .required = col.is_not_null,
+            .description = col.description,
+        });
+        return std.json.parseFromSliceLeaky(std.json.Value, arena, out.items, .{});
     }
 
     fn tableMeta(
@@ -1114,8 +1180,7 @@ pub const Server = struct {
                 if (std.mem.eql(u8, current.name, col.name)) change.from = @intCast(i);
             }
         }
-        const path = table_spec.name_path;
-        try s.db.changeTableColumns(arena, path[0], path[1], path[2], .{
+        try s.db.changeTableColumns(arena, table_spec.name_path, .{
             .layout = layout,
             .metadata = metadata,
         });
@@ -4611,6 +4676,29 @@ test "tables.patch appends columns and STRUCT fields, and later inserts carry th
     try testing.expectEqual(std.http.Status.ok, q.status);
     try testing.expect(std.mem.indexOf(u8, q.body,
         \\[{"f":[{"v":"1"},{"v":null},{"v":"10"},{"v":"0"}]},{"f":[{"v":"2"},{"v":"new"},{"v":"20"},{"v":"2"}]}]
+    ) != null);
+}
+
+test "ALTER TABLE shows through tables.get, keeping what the client posted for the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    _ = try request(s, arena, .POST, "/projects/test/datasets/ds1/tables",
+        \\{"tableReference":{"projectId":"test","datasetId":"ds1","tableId":"altered"},
+        \\ "schema":{"fields":[{"name":"name","type":"STRING","description":"who"},
+        \\   {"name":"age","type":"INTEGER"}]}}
+    );
+    const q = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"ALTER TABLE `test.ds1.altered` ADD COLUMN note STRING OPTIONS(description='why'), DROP COLUMN age"}
+    );
+    try testing.expectEqual(std.http.Status.ok, q.status);
+
+    const got = try request(s, arena, .GET, "/projects/test/datasets/ds1/tables/altered", "");
+    try testing.expect(std.mem.indexOf(u8, got.body,
+        \\"schema":{"fields":[{"description":"who","name":"name","type":"STRING"},{"description":"why","name":"note","type":"STRING"}]}
     ) != null);
 }
 
