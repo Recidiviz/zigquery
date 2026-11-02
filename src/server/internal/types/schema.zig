@@ -402,36 +402,33 @@ pub fn createTableDdl(
     table_id: []const u8,
     schema_json: ?std.json.Value,
 ) (std.mem.Allocator.Error || TypeError)![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.print(arena, "CREATE TABLE IF NOT EXISTS `{s}.{s}.{s}` (", .{
-        project_id, dataset_id, table_id,
+    const columns = try columnListDdl(arena, schema_json) orelse "`_placeholder` INT64";
+    return std.fmt.allocPrint(arena, "CREATE TABLE IF NOT EXISTS `{s}.{s}.{s}` ({s})", .{
+        project_id, dataset_id, table_id, columns,
     });
+}
 
-    var wrote_any = false;
-    if (schema_json) |s| {
-        if (s == .object) {
-            if (s.object.get("fields")) |fields| {
-                if (fields == .array) {
-                    for (fields.array.items) |field| {
-                        if (field != .object) continue;
-                        const name_v = field.object.get("name") orelse continue;
-                        if (name_v != .string) continue;
-                        if (wrote_any) try out.appendSlice(arena, ", ");
-                        try out.print(arena, "`{s}` {s}", .{
-                            name_v.string,
-                            try fieldTypeText(arena, field),
-                        });
-                        // REQUIRED is NOT NULL on the column
-                        if (isRequired(field)) try out.appendSlice(arena, " NOT NULL");
-                        wrote_any = true;
-                    }
-                }
-            }
-        }
+/// The CREATE TABLE column list for a schema's top-level fields, or null when it has none.
+pub fn columnListDdl(
+    arena: std.mem.Allocator,
+    schema_json: ?std.json.Value,
+) (std.mem.Allocator.Error || TypeError)!?[]const u8 {
+    const s = schema_json orelse return null;
+    if (s != .object) return null;
+    const fields = s.object.get("fields") orelse return null;
+    if (fields != .array) return null;
+    var out: std.ArrayList(u8) = .empty;
+    for (fields.array.items) |field| {
+        if (field != .object) continue;
+        const name_v = field.object.get("name") orelse continue;
+        if (name_v != .string) continue;
+        if (out.items.len > 0) try out.appendSlice(arena, ", ");
+        try out.print(arena, "`{s}` {s}", .{ name_v.string, try fieldTypeText(arena, field) });
+        // REQUIRED is NOT NULL on the column
+        if (isRequired(field)) try out.appendSlice(arena, " NOT NULL");
     }
-    if (!wrote_any) try out.appendSlice(arena, "`_placeholder` INT64");
-    try out.append(arena, ')');
-    return out.toOwnedSlice(arena);
+    if (out.items.len == 0) return null;
+    return out.items;
 }
 
 test "legacy type names map back to GoogleSQL" {

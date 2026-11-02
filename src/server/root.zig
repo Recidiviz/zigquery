@@ -14,6 +14,7 @@ pub const errors = @import("error.zig");
 pub const json_pb = @import("json_pb.zig");
 pub const debug_stats = @import("debug_stats.zig");
 pub const schema = @import("internal/types/schema.zig");
+pub const schema_update = @import("internal/types/schema_update.zig");
 pub const rowvalue = @import("internal/types/rowvalue.zig");
 pub const queryparam = @import("internal/types/queryparam.zig");
 pub const tablerow = @import("internal/types/tablerow.zig");

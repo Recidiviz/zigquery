@@ -26,6 +26,7 @@ pub const codec_sortable = @import("internal/codec_sortable.zig");
 pub const encoder = @import("internal/encoder.zig");
 pub const sqlbuilder = @import("internal/sqlbuilder/sqlbuilder.zig");
 pub const spec = @import("internal/spec.zig");
+pub const column_change = @import("internal/column_change.zig");
 pub const catalog = @import("internal/catalog.zig");
 pub const shared_catalog = @import("internal/shared_catalog.zig");
 pub const phase = @import("internal/phase.zig");

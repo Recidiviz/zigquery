@@ -41,6 +41,7 @@ const tabledata_handler = @import("handler/tabledata.zig");
 const contentdata = @import("internal/contentdata/repository.zig");
 const phase = zigquery.phase;
 const schema_mod = @import("internal/types/schema.zig");
+const schema_update = @import("internal/types/schema_update.zig");
 const stats_mod = @import("stats.zig");
 const debug_stats = @import("debug_stats.zig");
 const source_mod = @import("source.zig");
@@ -987,16 +988,23 @@ pub const Server = struct {
         const patch = std.json.parseFromSliceLeaky(std.json.Value, arena, req.body, .{}) catch {
             return badRequest(arena, "failed to decode request body");
         };
-        if (patch == .object and patch.object.contains("schema")) {
-            return badRequest(arena, "schema updates unsupported");
-        }
         const table_spec = (try s.db.catalogTable(arena, project_id, dataset_id, table_id)) orelse
             return notFound(arena, try std.fmt.allocPrint(
                 arena,
                 "table {s} is not found",
                 .{table_id},
             ));
-        const columns = try specColumnNames(arena, table_spec);
+        var schema_patch: SchemaPatch = .{};
+        if (patch == .object) if (patch.object.get("schema")) |posted| {
+            schema_patch = switch (try mergeSchemaPatch(arena, table_spec, posted)) {
+                .accepted => |accepted| accepted,
+                .rejected => |message| return badRequest(arena, message),
+            };
+        };
+        const columns = if (schema_patch.schema) |schema|
+            try tables_handler.schemaColumnNames(arena, schema)
+        else
+            try specColumnNames(arena, table_spec);
         if (try tableLayoutRejection(arena, patch, columns)) |rejection| return rejection;
 
         var merged: std.json.ObjectMap = .empty;
@@ -1008,10 +1016,26 @@ pub const Server = struct {
             var it = patch.object.iterator();
             while (it.next()) |kv| try merged.put(arena, kv.key_ptr.*, kv.value_ptr.*);
         }
+        if (schema_patch.schema) |schema| try merged.put(arena, "schema", schema);
 
         var metadata_json: std.ArrayList(u8) = .empty;
         try tables_handler.writeMetadata(arena, &metadata_json, .{ .object = merged });
         const json = metadata_json.items;
+        if (schema_patch.column_list) |column_list| {
+            s.changeColumns(arena, table_spec, column_list, json) catch {
+                return .{
+                    .status = .bad_request,
+                    .body = try errors.body(
+                        arena,
+                        .invalid,
+                        try query_handler.wrapEngineError(arena, s.db.lastError()),
+                    ),
+                };
+            };
+            const updated = (try s.db.catalogTable(arena, project_id, dataset_id, table_id)) orelse
+                return internalError(arena, "table vanished while being patched");
+            return .{ .body = try s.tableResource(arena, updated) };
+        }
         const outcome = s.db.setTableMetadata(arena, project_id, dataset_id, table_id, json);
         outcome catch |err| switch (err) {
             // A query's result table exists for the analyzer only; there
@@ -1026,6 +1050,75 @@ pub const Server = struct {
         const updated = (try s.db.catalogTable(arena, project_id, dataset_id, table_id)) orelse
             return internalError(arena, "table vanished while being patched");
         return .{ .body = try s.tableResource(arena, updated) };
+    }
+
+    /// What a patch's `schema` does to a table: the schema to store, and the column list to move
+    /// the table to when its columns change.
+    const SchemaPatch = struct {
+        schema: ?std.json.Value = null,
+        column_list: ?[]const u8 = null,
+    };
+
+    /// The posted schema merged into the table's (schema_update.zig), or the 400's message.
+    fn mergeSchemaPatch(
+        arena: std.mem.Allocator,
+        table_spec: *const zigquery.spec.TableSpec,
+        posted: std.json.Value,
+    ) !union(enum) { accepted: SchemaPatch, rejected: []const u8 } {
+        const posted_fields = fieldsOf(posted) orelse
+            return .{ .rejected = "schema.fields must be an array" };
+        const current = try schemaNode(arena, table_spec);
+        const path = table_spec.name_path;
+        const label = try std.fmt.allocPrint(arena, "{s}:{s}.{s}", .{ path[0], path[1], path[2] });
+        const outcome = try schema_update.merge(arena, .{
+            .current = if (current) |c| fieldsOf(c) orelse &.{} else &.{},
+            .posted = posted_fields,
+        }, label);
+        const accepted = switch (outcome) {
+            .accepted => |a| a,
+            .rejected => |message| return .{ .rejected = message },
+        };
+        var schema: std.json.ObjectMap = .empty;
+        try schema.put(arena, "fields", .{ .array = accepted.fields });
+        const merged: std.json.Value = .{ .object = schema };
+        if (!accepted.changes_columns) return .{ .accepted = .{ .schema = merged } };
+        const column_list = schema_mod.columnListDdl(arena, merged) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnknownFieldType => return .{
+                .rejected = "schema contains a field with an unsupported type",
+            },
+        };
+        return .{ .accepted = .{ .schema = merged, .column_list = column_list } };
+    }
+
+    fn fieldsOf(schema: std.json.Value) ?[]const std.json.Value {
+        if (schema != .object) return null;
+        const fields = schema.object.get("fields") orelse return &.{};
+        return if (fields == .array) fields.array.items else null;
+    }
+
+    /// Moves a table to the columns `column_list` declares, each continuing the current column of
+    /// the same name, and stores `metadata` with them. The message is in `lastError` on failure.
+    fn changeColumns(
+        s: *Server,
+        arena: std.mem.Allocator,
+        table_spec: *const zigquery.spec.TableSpec,
+        column_list: []const u8,
+        metadata: []const u8,
+    ) zigquery.driver.Error!void {
+        const columns = try s.db.columnSpecsFromColumnList(arena, column_list);
+        const layout = try arena.alloc(zigquery.column_change.ColumnChange, columns.len);
+        for (columns, layout) |col, *change| {
+            change.* = .{ .column = col };
+            for (table_spec.columns, 0..) |current, i| {
+                if (std.mem.eql(u8, current.name, col.name)) change.from = @intCast(i);
+            }
+        }
+        const path = table_spec.name_path;
+        try s.db.changeTableColumns(arena, path[0], path[1], path[2], .{
+            .layout = layout,
+            .metadata = metadata,
+        });
     }
 
     /// A tables request's 400 when the layout fields of `resource` name none of `columns`.
@@ -4469,7 +4562,90 @@ test "deleting a view drops it from the engine, and tables are listed by id" {
     try testing.expectEqual(std.http.Status.not_found, again.status);
 }
 
-test "tables.patch refuses to change a schema, as Go does" {
+test "tables.patch appends columns and STRUCT fields, and later inserts carry them" {
+    // client.update_table(table, ["schema"]) followed by insert_rows with the new fields.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    const path = "/projects/test/datasets/ds1/tables/evolving";
+    _ = try request(s, arena, .POST, "/projects/test/datasets/ds1/tables",
+        \\{"tableReference":{"projectId":"test","datasetId":"ds1","tableId":"evolving"},
+        \\ "schema":{"fields":[{"name":"id","type":"INTEGER","mode":"REQUIRED"},
+        \\   {"name":"r","type":"RECORD","fields":[{"name":"x","type":"INTEGER"}]}]}}
+    );
+    const before = try request(s, arena, .POST, path ++ "/insertAll",
+        \\{"rows":[{"json":{"id":"1","r":{"x":"10"}}}]}
+    );
+    try testing.expectEqualStrings("{}", before.body);
+
+    const patched = try request(s, arena, .PATCH, path,
+        \\{"schema":{"fields":[{"name":"id","type":"INTEGER","mode":"REQUIRED"},
+        \\   {"name":"note","type":"STRING","description":"free text"},
+        \\   {"name":"r","type":"RECORD","fields":[{"name":"x","type":"INTEGER"},
+        \\     {"name":"tags","type":"STRING","mode":"REPEATED"}]}]}}
+    );
+    try testing.expectEqual(std.http.Status.ok, patched.status);
+    // The current fields keep their order and new ones follow at the end of their RECORD. A
+    // RECORD's `fields` precede its `name` in the resource.
+    const field_order = [_][]const u8{ "id", "x", "tags", "r", "note" };
+    var at: usize = 0;
+    for (field_order) |name| {
+        const key = try std.fmt.allocPrint(arena, "\"name\":\"{s}\"", .{name});
+        const found = std.mem.indexOf(u8, patched.body[at..], key) orelse
+            return error.TestUnexpectedResult;
+        at += found;
+    }
+    const got = try request(s, arena, .GET, path, "");
+    try testing.expectEqualStrings(patched.body, got.body);
+
+    const after = try request(s, arena, .POST, path ++ "/insertAll",
+        \\{"rows":[{"json":{"id":"2","note":"new","r":{"x":"20","tags":["a","b"]}}}]}
+    );
+    try testing.expectEqualStrings("{}", after.body);
+    const q = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT id, note, r.x, ARRAY_LENGTH(r.tags) AS n FROM `test.ds1.evolving` ORDER BY id"}
+    );
+    try testing.expectEqual(std.http.Status.ok, q.status);
+    try testing.expect(std.mem.indexOf(u8, q.body,
+        \\[{"f":[{"v":"1"},{"v":null},{"v":"10"},{"v":"0"}]},{"f":[{"v":"2"},{"v":"new"},{"v":"20"},{"v":"2"}]}]
+    ) != null);
+}
+
+test "tables.patch relaxes REQUIRED to NULLABLE, so a NULL inserts" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    const path = "/projects/test/datasets/ds1/tables/strict";
+    _ = try request(s, arena, .POST, "/projects/test/datasets/ds1/tables",
+        \\{"tableReference":{"projectId":"test","datasetId":"ds1","tableId":"strict"},
+        \\ "schema":{"fields":[{"name":"id","type":"INTEGER","mode":"REQUIRED"},{"name":"v","type":"STRING"}]}}
+    );
+    _ = try request(s, arena, .POST, path ++ "/insertAll",
+        \\{"rows":[{"json":{"id":"1","v":"kept"}}]}
+    );
+    const patched = try request(s, arena, .PATCH, path,
+        \\{"schema":{"fields":[{"name":"id","type":"INTEGER","mode":"NULLABLE"},{"name":"v","type":"STRING"}]}}
+    );
+    try testing.expectEqual(std.http.Status.ok, patched.status);
+    const q = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"INSERT `test.ds1.strict` (v) VALUES ('no id')"}
+    );
+    try testing.expectEqual(std.http.Status.ok, q.status);
+    const rows = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT v FROM `test.ds1.strict` ORDER BY v"}
+    );
+    try testing.expect(std.mem.indexOf(u8, rows.body,
+        \\[{"f":[{"v":"kept"}]},{"f":[{"v":"no id"}]}]
+    ) != null);
+}
+
+test "tables.patch with an unchanged schema is a no-op, and a removal answers BigQuery's 400" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4477,12 +4653,28 @@ test "tables.patch refuses to change a schema, as Go does" {
     var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
     defer s.deinit();
     try createStreamTable(s, arena, "fixed");
+    const path = "/projects/test/datasets/ds1/tables/fixed";
 
-    const res = try request(s, arena, .PATCH, "/projects/test/datasets/ds1/tables/fixed",
+    const unchanged = try request(s, arena, .PATCH, path,
+        \\{"schema":{"fields":[{"name":"AGE","type":"INT64"},{"name":"name","type":"STRING"}]}}
+    );
+    try testing.expectEqual(std.http.Status.ok, unchanged.status);
+    try testing.expect(std.mem.indexOf(u8, unchanged.body, "\"name\":\"name\"") != null);
+
+    const removed = try request(s, arena, .PATCH, path,
         \\{"schema":{"fields":[{"name":"other","type":"STRING"}]}}
     );
-    try testing.expectEqual(std.http.Status.bad_request, res.status);
-    try testing.expect(std.mem.indexOf(u8, res.body, "schema updates unsupported") != null);
+    try testing.expectEqual(std.http.Status.bad_request, removed.status);
+    try testing.expect(std.mem.indexOf(u8, removed.body,
+        \\"message":"Provided Schema does not match Table test:ds1.fixed. Field name is missing in new schema"
+    ) != null);
+    const required = try request(s, arena, .PATCH, path,
+        \\{"schema":{"fields":[{"name":"name","type":"STRING"},{"name":"age","type":"INTEGER"},
+        \\  {"name":"must","type":"STRING","mode":"REQUIRED"}]}}
+    );
+    try testing.expect(std.mem.indexOf(u8, required.body,
+        \\Cannot add required fields to an existing schema. (field: must)
+    ) != null);
 }
 
 test "creating a view answers with the schema the view resolves to" {

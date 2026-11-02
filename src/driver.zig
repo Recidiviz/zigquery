@@ -22,6 +22,7 @@ const pb = @import("proto/resolved_ast.zig");
 const value_mod = @import("internal/value.zig");
 const encoder = @import("internal/encoder.zig");
 const spec = @import("internal/spec.zig");
+const column_change = @import("internal/column_change.zig");
 const sqlbuilder = @import("internal/sqlbuilder/sqlbuilder.zig");
 const coordinator_mod = @import("internal/coordinator/coordinator.zig");
 const context_mod = @import("internal/coordinator/context.zig");
@@ -828,6 +829,164 @@ pub const Db = struct {
         updated.metadata = metadata_json;
         updated.updated_at = now.rfc3339;
         try g.catalog.updateTableSpec(&db.sqlite_db, &updated);
+    }
+
+    /// A table's columns after a schema change, and the metadata API's resource to store with
+    /// them.
+    pub const TableColumnsChange = struct {
+        layout: []const column_change.ColumnChange,
+        /// Replaces `TableSpec.metadata`; null keeps it.
+        metadata: ?[]const u8 = null,
+    };
+
+    /// Moves `project.dataset.table` to a new column layout, rows included, and re-registers it
+    /// so every connection's analyzer sees the new columns. The SQLite changes land together or
+    /// not at all; the catalog changes only once they have.
+    pub fn changeTableColumns(
+        db: *Db,
+        arena: std.mem.Allocator,
+        project_id: []const u8,
+        dataset_id: []const u8,
+        table_id: []const u8,
+        change: TableColumnsChange,
+    ) Error!void {
+        const current = (try db.catalogTable(arena, project_id, dataset_id, table_id)) orelse {
+            db.setLastError("table not found");
+            return error.ExecFailed;
+        };
+        if (current.is_view or current.is_temp or current.is_synthetic) {
+            db.setLastError("only a persistent table's columns can change");
+            return error.ExecFailed;
+        }
+        const columns = try arena.alloc(*spec.ColumnSpec, change.layout.len);
+        for (change.layout, columns) |c, *col| col.* = @constCast(c.column);
+        const now = catalog_mod.nowTimestamps(arena) catch return error.OutOfMemory;
+        const updated = try arena.create(spec.TableSpec);
+        updated.* = current.*;
+        updated.columns = columns;
+        updated.updated_at = now.rfc3339;
+        if (change.metadata) |m| updated.metadata = m;
+
+        const steps = column_change.plan(arena, current.columns, change.layout) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.IncompatibleType, error.InvalidType => {
+                    db.setLastError("a column's new type does not extend its current type");
+                    return error.ExecFailed;
+                },
+            };
+        const table_name = try current.tableName(arena);
+        var savepoint = try Savepoint.begin(db, arena);
+        errdefer savepoint.rollback();
+        switch (steps) {
+            .in_place => |in_place| try db.changeColumnsInPlace(arena, table_name, in_place),
+            .rebuild => |select_list| try db.rebuildTable(arena, updated, select_list),
+        }
+        try savepoint.release();
+        db.registerTableSpec(updated) catch |err| return db.failCatalog(err);
+    }
+
+    fn changeColumnsInPlace(
+        db: *Db,
+        arena: std.mem.Allocator,
+        table_name: []const u8,
+        in_place: @FieldType(column_change.Plan, "in_place"),
+    ) Error!void {
+        for (in_place.added) |col| {
+            const declaration = col.declarationSql(arena) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransformFailed,
+            };
+            _ = try db.execSql(arena, try std.fmt.allocPrint(
+                arena,
+                "ALTER TABLE `{s}` ADD COLUMN {s}",
+                .{ table_name, declaration },
+            ), &.{});
+        }
+        if (in_place.rewrites.len == 0) return;
+        _ = try db.execSql(arena, try std.fmt.allocPrint(arena, "UPDATE `{s}` SET {s}", .{
+            table_name,
+            try std.mem.join(arena, ", ", in_place.rewrites),
+        }), &.{});
+    }
+
+    /// Builds `updated`'s declared shape under a scratch name, fills it from the current table
+    /// through `select_list`, and swaps it in, as CREATE OR REPLACE ... AS does.
+    fn rebuildTable(
+        db: *Db,
+        arena: std.mem.Allocator,
+        updated: *const spec.TableSpec,
+        select_list: []const []const u8,
+    ) Error!void {
+        const table_name = try updated.tableName(arena);
+        const scratch = try std.fmt.allocPrint(arena, "{s}__zigquery_alter", .{table_name});
+        _ = try db.execSql(arena, try std.fmt.allocPrint(
+            arena,
+            "DROP TABLE IF EXISTS `{s}`",
+            .{scratch},
+        ), &.{});
+        const create = updated.declaredSchemaAs(arena, scratch) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TransformFailed,
+        };
+        _ = try db.execSql(arena, create, &.{});
+        _ = try db.execSql(arena, try std.fmt.allocPrint(
+            arena,
+            "INSERT INTO `{s}` SELECT {s} FROM `{s}`",
+            .{ scratch, try std.mem.join(arena, ", ", select_list), table_name },
+        ), &.{});
+        _ = try db.execSql(arena, try std.fmt.allocPrint(
+            arena,
+            "DROP TABLE `{s}`",
+            .{table_name},
+        ), &.{});
+        // Legacy mode renames the table alone; modern mode re-checks every view in the schema
+        // and refuses while one names a table that no longer exists.
+        _ = try db.execSql(arena, "PRAGMA legacy_alter_table = ON", &.{});
+        defer db.execCleanup(arena, "PRAGMA legacy_alter_table = OFF");
+        _ = try db.execSql(arena, try std.fmt.allocPrint(
+            arena,
+            "ALTER TABLE `{s}` RENAME TO `{s}`",
+            .{ scratch, table_name },
+        ), &.{});
+        try db.execPkIndex(arena, updated);
+    }
+
+    /// The columns a `CREATE TABLE` column list declares, as the analyzer resolves them, for a
+    /// schema that arrives as text rather than as a statement.
+    pub fn columnSpecsFromColumnList(
+        db: *Db,
+        arena: std.mem.Allocator,
+        column_list: []const u8,
+    ) Error![]const *spec.ColumnSpec {
+        const sql = try std.fmt.allocPrintSentinel(
+            arena,
+            "CREATE TABLE `zigquery_columns` ({s})",
+            .{column_list},
+            0,
+        );
+        const analyzed = analyzer_ffi.analyzeNextStatement(arena, sql, 0, "{}") catch |err| {
+            db.setLastError(analyzer_ffi.last_error);
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AnalyzeFailed,
+            };
+        };
+        const statement = statementNodeOf(analyzed.node) orelse return error.TransformFailed;
+        const create_any = switch (statement) {
+            .resolved_create_statement_node => |c| c,
+            else => return error.TransformFailed,
+        };
+        const base_any = switch (create_any.node orelse return error.TransformFailed) {
+            .resolved_create_table_stmt_base_node => |b| b,
+            else => return error.TransformFailed,
+        };
+        const ct = switch (base_any.node orelse return error.TransformFailed) {
+            .resolved_create_table_stmt_node => |ct| ct,
+            else => return error.TransformFailed,
+        };
+        const base = ct.parent orelse return error.TransformFailed;
+        return columnSpecsFromDefs(arena, base.column_definition_list);
     }
 
     /// Declares that `project.dataset` exists, carrying the metadata API's resource text.
