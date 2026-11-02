@@ -4135,6 +4135,7 @@ googlesql/information_schema/tables	TABLES lists every table in the dataset
 googlesql/syntax/cte/with_recursive	count 1..5 with recursive CTE
 googlesql/syntax/cte/with_recursive	count down with recursive CTE
 googlesql/syntax/cte/with_recursive	factorial via recursive CTE
+googlesql/syntax/ddl/alter_table	ALTER TABLE ADD COLUMN is accepted by the analyzer
 googlesql/syntax/ddl/create_function	CREATE FUNCTION registers a callable UDF
 googlesql/syntax/ddl/create_or_replace_table	CREATE OR REPLACE replaces the existing table's schema
 googlesql/syntax/ddl/create_or_replace_view	CREATE OR REPLACE VIEW substitutes the new definition
@@ -5105,6 +5106,34 @@ zigquery/syntax/cte/with_recursive	recursive cte with star expression
 zigquery/syntax/cte/with_recursive	recursive cte with list expression in WHERE
 zigquery/syntax/cte/with_recursive	recursive cte with unary expression
 zigquery/syntax/cte/with_recursive	recursive cte with complex list and star in join
+zigquery/syntax/ddl/alter_table	the table: a key, a clustering column, a partitioning column and a STRUCT
+zigquery/syntax/ddl/alter_table	an added column reads NULL in an existing row
+zigquery/syntax/ddl/alter_table	an added ARRAY column reads empty in an existing row
+zigquery/syntax/ddl/alter_table	rows written after ADD COLUMN carry it
+zigquery/syntax/ddl/alter_table	adding a column that exists is an error
+zigquery/syntax/ddl/alter_table	IF NOT EXISTS skips a column that exists, whatever type it names
+zigquery/syntax/ddl/alter_table	an added column cannot be NOT NULL
+zigquery/syntax/ddl/alter_table	an added STRUCT may have a NOT NULL member, which later rows must fill
+zigquery/syntax/ddl/alter_table	one statement cannot add the same column twice
+zigquery/syntax/ddl/alter_table	dropping a column that does not exist is an error
+zigquery/syntax/ddl/alter_table	IF EXISTS skips a column that does not exist
+zigquery/syntax/ddl/alter_table	a partitioning column cannot be dropped
+zigquery/syntax/ddl/alter_table	a clustering column cannot be dropped
+zigquery/syntax/ddl/alter_table	a primary key column cannot be dropped
+zigquery/syntax/ddl/alter_table	a failing action leaves the actions before it undone
+zigquery/syntax/ddl/alter_table	the column the failed statement added is not there
+zigquery/syntax/ddl/alter_table	one statement cannot add and drop the same column
+zigquery/syntax/ddl/alter_table	DROP COLUMN matches the name ignoring case, and the rows keep their other values
+zigquery/syntax/ddl/alter_table	a dropped STRUCT column takes its NOT NULL members with it
+zigquery/syntax/ddl/alter_table	a column dropped and added in one statement comes back empty, with its new type
+zigquery/syntax/ddl/alter_table	IF EXISTS is refused on a statement that changes columns
+zigquery/syntax/ddl/alter_table	the last column cannot be dropped
+zigquery/syntax/ddl/alter_table	a view over the table sees an added column through SELECT *
+zigquery/syntax/ddl/alter_table	a view that names a dropped column fails when it is read, not when the column is dropped
+zigquery/syntax/ddl/alter_table	ALTER TABLE cannot change a view's columns
+zigquery/syntax/ddl/alter_table	an action other than ADD COLUMN or DROP COLUMN is refused by name
+zigquery/syntax/ddl/alter_table	an added column cannot have a default
+zigquery/syntax/ddl/alter_table	CREATE TABLE refuses a column default
 zigquery/syntax/ddl/create_function	create function
 zigquery/syntax/ddl/create_function	use function
 zigquery/syntax/ddl/create_function	create temp function
