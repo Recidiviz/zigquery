@@ -497,6 +497,55 @@ fn memberPresent(r: *BinReader, path: []const u8) ValueError!bool {
     return memberPresent(r, remaining_segments);
 }
 
+/// `v` with a member named `key`, holding `member`, appended to every STRUCT that `path` reaches,
+/// for a STRUCT column whose type gained a trailing field. `path` is positional, as
+/// `requiredMemberPresent` reads it, with "" for `v` itself. A NULL on the way has no members to
+/// extend.
+pub fn appendMember(
+    alloc: std.mem.Allocator,
+    v: Value,
+    path: []const u8,
+    key: []const u8,
+    member: Value,
+) ValueError!void {
+    switch (v) {
+        .null => return,
+        .array => |arr| {
+            const rest = try pathAfter(path, "[]");
+            for (arr.values) |elem| try appendMember(alloc, elem, rest, key, member);
+        },
+        .struct_ => |st| {
+            if (path.len == 0) {
+                const keys = try alloc.alloc([]const u8, st.keys.len + 1);
+                @memcpy(keys[0..st.keys.len], st.keys);
+                keys[st.keys.len] = key;
+                const values = try alloc.alloc(Value, st.values.len + 1);
+                @memcpy(values[0..st.values.len], st.values);
+                values[st.values.len] = member;
+                st.keys = keys;
+                st.values = values;
+                return;
+            }
+            const dot = std.mem.indexOfScalar(u8, path, '.');
+            const segment = if (dot) |d| path[0..d] else path;
+            const index = std.fmt.parseInt(usize, segment, 10) catch return error.CorruptData;
+            if (index >= st.values.len) return error.CorruptData;
+            const rest = if (dot) |d| path[d + 1 ..] else "";
+            return appendMember(alloc, st.values[index], rest, key, member);
+        },
+        else => return error.CorruptData,
+    }
+}
+
+/// `path` past its leading `segment`, which must be there.
+fn pathAfter(path: []const u8, segment: []const u8) ValueError![]const u8 {
+    if (!std.mem.startsWith(u8, path, segment)) return error.CorruptData;
+    const rest = path[segment.len..];
+    if (rest.len == 0) return rest;
+    if (rest[0] != '.') return error.CorruptData;
+    return rest[1..];
+}
+
 /// An encoded ARRAY or STRUCT, positioned for reading one entry out of it.
 ///
 /// `ArrayWalker` below streams every element in order, which is what UNNEST
@@ -692,6 +741,32 @@ test "CompositeRef reads one entry without decoding the others" {
     // A truncated element is caught by the walk, not returned as junk.
     var w = try CompositeRef.init(arr[0 .. arr.len - 2]);
     try testing.expectError(error.CorruptData, w.at(alloc, elems.len - 1));
+}
+
+test "appendMember extends every STRUCT a path reaches, through arrays, past NULLs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const inner = try value_mod.structValue(alloc, &.{"y"}, &.{.{ .string = "kept" }});
+    const elems = try value_mod.arrayValue(alloc, &.{ inner, Value.null });
+    const outer = try value_mod.structValue(alloc, &.{ "x", "items" }, &.{ .{ .int = 4 }, elems });
+    const empty = try value_mod.arrayValue(alloc, &.{});
+    try appendMember(alloc, outer, "1.[]", "z", Value.null);
+    try appendMember(alloc, outer, "", "w", empty);
+
+    const want_inner = try value_mod.structValue(
+        alloc,
+        &.{ "y", "z" },
+        &.{ .{ .string = "kept" }, Value.null },
+    );
+    const want = try value_mod.structValue(alloc, &.{ "x", "items", "w" }, &.{
+        .{ .int = 4 },
+        try value_mod.arrayValue(alloc, &.{ want_inner, Value.null }),
+        empty,
+    });
+    try value_mod.expectValueEqual(want, try roundTrip(alloc, outer));
+    try testing.expectError(error.CorruptData, appendMember(alloc, outer, "0", "q", Value.null));
 }
 
 test "requiredMemberPresent finds a NULL member by position, through structs and arrays" {
