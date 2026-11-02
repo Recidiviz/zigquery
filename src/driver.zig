@@ -62,6 +62,9 @@ pub const Error = error{
     /// returning, so there is no `lastError` to carry an explanation — the
     /// error name has to be the explanation.
     IncompatibleStorageFormat,
+    /// The database was written by goccy/bigquery-emulator, whose storage this build cannot
+    /// read: go-zetasqlite's catalog table, and no storage format stamp.
+    GoccyEmulatorDatabase,
     OutOfMemory,
 } || sqlite.Error;
 
@@ -399,13 +402,15 @@ pub const Db = struct {
         };
         errdefer db.sqlite_db.close();
         if (opts.busy_timeout_ms) |ms| db.sqlite_db.busyTimeout(ms);
+        // Ahead of the pragmas, which write to the file, so a refused database is left as found.
+        const unstamped = try db.checkStorageFormat();
         for (opts.pragmas) |pragma| {
             db.sqlite_db.exec(pragma) catch {
                 if (opts.failure) |f| f.record(&db.sqlite_db);
                 return error.ExecFailed;
             };
         }
-        try db.checkStorageFormat();
+        if (unstamped) db.stampStorageFormat();
         // zigquery_* UDFs and the unnest vtab.
         db.udf_state = function.registerAll(&db.sqlite_db, gpa) catch
             return error.ExecFailed;
@@ -490,29 +495,37 @@ pub const Db = struct {
     /// lookups.
     pub const storage_format_version: i64 = 5;
 
-    /// Refuses a database this build cannot read, and stamps a new one.
+    /// Refuses a database this build cannot read, and reports whether it is new and so needs
+    /// `stampStorageFormat`. Reads only.
     ///
     /// `user_version` is 0 both for a database this engine has never touched and
     /// for every database written before the stamp existed. The two are told
     /// apart by whether the catalog is already there: an unstamped database that
     /// already holds one was written by an older format, and adopting it would
     /// read its TEXT values as though they were BLOBs, silently, on every one.
-    fn checkStorageFormat(db: *Db) Error!void {
-        const found = db.readUserVersion() orelse return;
-        if (found == storage_format_version) return;
+    /// An unstamped database holding go-zetasqlite's catalog is goccy/bigquery-emulator's,
+    /// and adopting it would serve an empty project over the data in it.
+    fn checkStorageFormat(db: *Db) Error!bool {
+        const found = db.readUserVersion() orelse return false;
+        if (found == storage_format_version) return false;
         if (found != 0) return error.IncompatibleStorageFormat;
-        if (db.hasCatalogTable()) return error.IncompatibleStorageFormat;
-        // Fresh database. Best-effort: a read-only connection cannot stamp one,
-        // and an empty database has nothing to misread either way.
+        if (db.hasTable("zigquery_catalog")) return error.IncompatibleStorageFormat;
+        if (db.hasTable("zetasqlite_catalog")) return error.GoccyEmulatorDatabase;
+        return true;
+    }
+
+    /// Best-effort: a read-only connection cannot stamp a database, and an empty
+    /// database has nothing to misread either way.
+    fn stampStorageFormat(db: *Db) void {
         db.sqlite_db.exec(std.fmt.comptimePrint(
             "PRAGMA user_version = {d}",
             .{storage_format_version},
         )) catch |err| std.log.info("storage format version not stamped: {t}", .{err});
     }
 
-    fn hasCatalogTable(db: *Db) bool {
+    fn hasTable(db: *Db, comptime name: []const u8) bool {
         var stmt = db.sqlite_db.prepare(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'zigquery_catalog'",
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '" ++ name ++ "'",
         ) catch return false;
         defer stmt.finalize();
         return stmt.step() catch false;
@@ -7220,6 +7233,44 @@ test "storage format gate stamps an unversioned database and rejects a foreign o
         raw.close();
     }
     try testing.expectError(error.IncompatibleStorageFormat, Db.open(testing.allocator, db_path));
+}
+
+test "storage format gate refuses a goccy/bigquery-emulator database and leaves it untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const db_path = try std.fmt.allocPrintSentinel(
+        arena_state.allocator(),
+        ".zig-cache/tmp/{s}/goccy.db",
+        .{tmp.sub_path},
+        0,
+    );
+
+    // go-zetasqlite's catalog table; the emulator never sets user_version.
+    {
+        var raw = try sqlite.Db.open(db_path);
+        defer raw.close();
+        try raw.exec("CREATE TABLE zetasqlite_catalog (name STRING PRIMARY KEY, kind STRING)");
+    }
+
+    try testing.expectError(error.GoccyEmulatorDatabase, Db.openWith(testing.allocator, db_path, .{
+        .pragmas = &.{"PRAGMA journal_mode = WAL"},
+    }));
+
+    var raw = try sqlite.Db.open(db_path);
+    defer raw.close();
+    var stmt = try raw.prepare(
+        "SELECT (SELECT user_version FROM pragma_user_version)," ++
+            " (SELECT journal_mode FROM pragma_journal_mode)," ++
+            " (SELECT count(*) FROM sqlite_master WHERE name = 'zigquery_catalog')",
+    );
+    defer stmt.finalize();
+    try testing.expect(try stmt.step());
+    try testing.expectEqual(@as(i64, 0), stmt.columnInt64(0));
+    try testing.expectEqualStrings("delete", stmt.columnText(1));
+    try testing.expectEqual(@as(i64, 0), stmt.columnInt64(2));
 }
 
 test "openWith applies pragmas and leaves open() behaviour unchanged" {

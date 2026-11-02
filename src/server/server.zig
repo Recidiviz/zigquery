@@ -67,6 +67,10 @@ const OpenFailureReport = struct {
             return w.writeAll("written in a storage format this build does not read; " ++
                 "point --database at a new file");
         }
+        if (r.err == error.GoccyEmulatorDatabase) {
+            return w.writeAll("written by goccy/bigquery-emulator, whose storage this build " ++
+                "does not read; point --database at a new file");
+        }
         const c = zigquery.sqlite.c;
         if (r.failure.code == c.SQLITE_OK) return w.print("{t}", .{r.err});
         try w.writeAll(r.failure.message());
@@ -3409,6 +3413,12 @@ test "OpenFailureReport names the file, SQLite's reason and the errno" {
         "cannot open --database=/data/bq.db: written in a storage format this build " ++
             "does not read; point --database at a new file",
         error.IncompatibleStorageFormat,
+        .{},
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: written by goccy/bigquery-emulator, whose " ++
+            "storage this build does not read; point --database at a new file",
+        error.GoccyEmulatorDatabase,
         .{},
     );
     try expectOpenFailure(
