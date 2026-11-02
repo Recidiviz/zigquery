@@ -1,4 +1,4 @@
-// ALTER TABLE ADD COLUMN and DROP COLUMN. Every expected message is BigQuery's own
+// ALTER TABLE ADD COLUMN, DROP COLUMN and RENAME COLUMN. Every expected message is BigQuery's own
 // (recidiviz-bigquery-sandbox, 2026-11-02). The cases share one connection (no `.setup`), so each
 // sees the table the ones before it left.
 .{
@@ -185,7 +185,7 @@
             .rows = .{},
         },
         .{
-            .desc = "an action other than ADD COLUMN or DROP COLUMN is refused by name",
+            .desc = "an action other than ADD, DROP or RENAME COLUMN is refused by name",
             .sql = "ALTER TABLE at_base SET OPTIONS (description = 'x')",
             .expect_error = "ALTER TABLE SET OPTIONS is not supported",
             .rows = .{},
@@ -194,6 +194,86 @@
             .desc = "an added column cannot have a default",
             .sql = "ALTER TABLE at_base ADD COLUMN df STRING DEFAULT 'dflt'",
             .expect_error = "Add field with default value to an existing table schema is not supported; Field: df. You can achieve the same result by executing the following 3 statements: \n1. ALTER TABLE my_table ADD COLUMN df; \n2. ALTER TABLE my_table ALTER COLUMN df SET DEFAULT 'dflt'; \n3. UPDATE my_table SET df = 'dflt' WHERE TRUE; \n",
+            .rows = .{},
+        },
+        .{
+            .desc = "rename: the table",
+            .sql =
+            \\CREATE TABLE at_rn (a INT64 NOT NULL, b STRING, d DATE,
+            \\  r STRUCT<x INT64, y STRING NOT NULL>, PRIMARY KEY (a) NOT ENFORCED)
+            \\  PARTITION BY d CLUSTER BY b;
+            \\INSERT INTO at_rn (a, b, d, r) VALUES (1, 'one', DATE '2020-01-01', STRUCT(5, 'y'));
+            \\CREATE VIEW at_rn_named AS SELECT r.x FROM at_rn
+            ,
+            .rows = .{},
+        },
+        .{
+            .desc = "a renamed column keeps its values under the new name",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN r TO r2; SELECT r2.x, r2.y FROM at_rn",
+            .rows = .{
+                .{ 5, "y" },
+            },
+        },
+        .{
+            .desc = "a renamed STRUCT's NOT NULL members are reported under the new name",
+            .sql = "INSERT INTO at_rn (a, r2) VALUES (2, STRUCT(1 AS x, CAST(NULL AS STRING) AS y))",
+            .expect_error = "Required field r2.y cannot be null; error in writing field r2",
+            .rows = .{},
+        },
+        .{
+            .desc = "the old name is gone",
+            .sql = "SELECT r FROM at_rn",
+            .expect_error = "Unrecognized name: r",
+            .rows = .{},
+        },
+        .{
+            .desc = "a view that names a renamed column fails when it is read",
+            .sql = "SELECT * FROM at_rn_named",
+            .expect_error = "Unrecognized name: r",
+            .rows = .{},
+        },
+        .{
+            .desc = "renames in one statement apply in order",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN r2 TO r3, RENAME COLUMN r3 TO r4; SELECT r4.x FROM at_rn",
+            .rows = .{
+                .{5},
+            },
+        },
+        .{
+            .desc = "renaming a column that does not exist is an error",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN nope TO z",
+            .expect_error = "ALTER TABLE RENAME COLUMN not found: nope",
+            .rows = .{},
+        },
+        .{
+            .desc = "IF EXISTS skips a column that does not exist",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN IF EXISTS nope TO z; SELECT COUNT(*) FROM at_rn",
+            .rows = .{
+                .{1},
+            },
+        },
+        .{
+            .desc = "renaming onto a column that exists is an error",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN r4 TO b",
+            .expect_error = "Column already exists: b",
+            .rows = .{},
+        },
+        .{
+            .desc = "a partitioning column cannot be renamed",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN d TO d2",
+            .expect_error = "Column `d` cannot be renamed in table `at_rn`. Columns used in table partitioning or clustering cannot be renamed.",
+            .rows = .{},
+        },
+        .{
+            .desc = "a clustering column cannot be renamed",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN b TO b2",
+            .expect_error = "Column `b` cannot be renamed in table `at_rn`. Columns used in table partitioning or clustering cannot be renamed.",
+            .rows = .{},
+        },
+        .{
+            .desc = "a primary key column cannot be renamed",
+            .sql = "ALTER TABLE at_rn RENAME COLUMN a TO a2",
+            .expect_error = "Column `a` used as primary key cannot be renamed in table `at_rn`.",
             .rows = .{},
         },
         // The engine applies no column default, so CREATE TABLE refuses one.

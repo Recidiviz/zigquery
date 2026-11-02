@@ -99,3 +99,20 @@ class TestSchemaUpdates(BigQueryEmulatorTestCase):
                 f"ALTER TABLE `{self._name('altered')}` DROP COLUMN a, DROP COLUMN c"
             ).result()
         self.assertIn("Cannot DROP last column from the table.", raised.exception.message)
+
+    def test_alter_table_rename_column(self) -> None:
+        address = BigQueryAddress(dataset_id=_DATASET, table_id="renamed")
+        self.create_mock_table(
+            address,
+            schema=[SchemaField("a", "INTEGER"), SchemaField("b", "STRING", description="kept")],
+        )
+        self.load_rows_into_table(address, [{"a": 1, "b": "x"}])
+        self.client.query(
+            f"ALTER TABLE `{self._name('renamed')}` RENAME COLUMN b TO label"
+        ).result()
+
+        table = self.client.get_table(self._name("renamed"))
+        self.assertEqual(["a", "label"], [field.name for field in table.schema])
+        self.assertEqual("kept", table.schema[1].description)
+        rows = self.client.query(f"SELECT label FROM `{self._name('renamed')}`").result()
+        self.assertEqual(["x"], [row["label"] for row in rows])
