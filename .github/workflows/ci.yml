@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: "0.17.0-dev.2131+d08989840"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   shim:
