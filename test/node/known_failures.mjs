@@ -3,7 +3,4 @@
 
 export const KNOWN_FAILURES = {
   'createLoadJob accepts a gs:// source': 'configuration.load.sourceUris is refused',
-
-  'a resumable upload session URI names the host the client used':
-    'the session URI names the address the server binds',
 };

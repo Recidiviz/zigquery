@@ -56,6 +56,8 @@ pub const Headers = struct {
     /// What a resumable upload says its bytes will be.
     x_upload_content_type: ?[]const u8 = null,
     x_upload_content_length: ?[]const u8 = null,
+    /// The authority the client addressed, which a resumable session URI has to name.
+    host: ?[]const u8 = null,
 };
 
 pub const Request = struct {
@@ -274,6 +276,8 @@ pub const Server = struct {
                     &out.x_upload_content_type
                 else if (std.ascii.eqlIgnoreCase(header.name, "x-upload-content-length"))
                     &out.x_upload_content_length
+                else if (std.ascii.eqlIgnoreCase(header.name, "host"))
+                    &out.host
                 else
                     continue;
             slot.* = try arena.dupe(u8, header.value);

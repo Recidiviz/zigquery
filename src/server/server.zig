@@ -1512,8 +1512,7 @@ pub const Server = struct {
         return s.runLoadJob(arena, project_id, parts.metadata, parts.media);
     }
 
-    /// The initiating request of a resumable upload. Answers with the session URI the bytes
-    /// are sent to. api-uploads
+    /// The initiating request of a resumable upload.
     fn openUploadSession(
         s: *Server,
         req: *const http_server.Request,
@@ -1547,7 +1546,7 @@ pub const Server = struct {
                     arena,
                     "http://{s}/upload/bigquery/v2/projects/{s}/jobs" ++
                         "?uploadType=resumable&upload_id={s}",
-                    .{ s.endpoint, project_id, id },
+                    .{ req.headers.host orelse s.endpoint, project_id, id },
                 ),
             }}),
         };
@@ -2702,6 +2701,49 @@ test "jobs.insert refuses a malformed jobId" {
         \\ "configuration":{"query":{"query":"SELECT 1","useLegacySql":false}}}
     );
     try testing.expectEqual(std.http.Status.bad_request, res.status);
+}
+
+test "a resumable session URI names the Host the client sent, else the bind address" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const metadata =
+        \\{"configuration":{"load":{"destinationTable":
+        \\ {"projectId":"test","datasetId":"ds","tableId":"t"}}}}
+    ;
+    const addressed = try s.handler().func(s.handler().ctx, &.{
+        .method = .POST,
+        .path = "/upload/bigquery/v2/projects/test/jobs",
+        .query = "uploadType=resumable",
+        .headers = .{ .host = "bigquery-emulator:9050" },
+        .body = metadata,
+        .arena = arena,
+    });
+    try testing.expectEqual(std.http.Status.ok, addressed.status);
+    try testing.expectEqualStrings("location", addressed.extra_headers[0].name);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        addressed.extra_headers[0].value,
+        "http://bigquery-emulator:9050/upload/bigquery/v2/projects/test/jobs?uploadType=resumable",
+    ));
+
+    const bare = try requestQuery(
+        s,
+        arena,
+        .POST,
+        "/upload/bigquery/v2/projects/test/jobs",
+        "uploadType=resumable",
+        metadata,
+    );
+    try testing.expect(std.mem.startsWith(
+        u8,
+        bare.extra_headers[0].value,
+        try std.fmt.allocPrint(arena, "http://{s}/upload/", .{s.endpoint}),
+    ));
 }
 
 test "jobs.insert binds a positional parameter" {
