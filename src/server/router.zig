@@ -57,6 +57,7 @@ pub const Route = struct {
         tables_delete,
         tables_patch,
         tabledata_insert_all,
+        tabledata_list,
         debug_stats,
     };
 
@@ -66,7 +67,7 @@ pub const Route = struct {
     pattern: []const u8,
 };
 
-/// The implemented surface. tabledata.list is not here yet; insertAll is.
+/// The implemented surface.
 pub const routes = [_]Route{
     .{ .id = .discovery, .method = .GET, .pattern = "/discovery/v1/apis/bigquery/v2/rest" },
     .{ .id = .discovery, .method = .GET, .pattern = "/$discovery/rest" },
@@ -119,6 +120,7 @@ pub const routes = [_]Route{
         .method = .POST,
         .pattern = "/projects/*/datasets/*/tables/*/insertAll",
     },
+    .{ .id = .tabledata_list, .method = .GET, .pattern = "/projects/*/datasets/*/tables/*/data" },
 };
 
 /// Go registers every handler twice: bare, and under `/bigquery/v2`
@@ -233,6 +235,11 @@ test "insertAll sits under the table path and captures three ids" {
     try testing.expectEqualStrings("p", out.matched.captures.get(0));
     try testing.expectEqualStrings("ds", out.matched.captures.get(1));
     try testing.expectEqualStrings("t", out.matched.captures.get(2));
+
+    try testing.expectEqual(
+        Route.Id.tabledata_list,
+        match(.GET, "/projects/p/datasets/ds/tables/t/data").matched.route,
+    );
 
     // A table literally named insertAll is still a table GET, not an insert.
     try testing.expectEqual(

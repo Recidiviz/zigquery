@@ -436,6 +436,41 @@ pub fn writeResultSet(
     try out.appendSlice(arena, body);
 }
 
+/// The tabledata.list response. rest/v2/tabledata/list#response-body
+const TableDataList = struct {
+    kind: []const u8 = "bigquery#tableDataList",
+    /// A string on the wire.
+    totalRows: []const u8,
+    /// Absent unless this page is short of the total.
+    pageToken: ?[]const u8 = null,
+    rows: []const tablerow.TableRow,
+};
+
+/// Serializes the rows of a table that `page` selects as a tabledata.list response.
+pub fn writeTableDataList(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    set: ResultSet,
+    page: Page,
+    use_int64_timestamp: bool,
+) !void {
+    const render = try set.renderer(arena, use_int64_timestamp);
+    const window = page.range(set.total_rows);
+    const rows = try arena.alloc(tablerow.TableRow, window.next - window.first);
+    for (window.first..window.next) |row| {
+        rows[row - window.first] = .{ .cells = try render.row(row) };
+    }
+    const body = try std.json.Stringify.valueAlloc(arena, TableDataList{
+        .totalRows = try std.fmt.allocPrint(arena, "{d}", .{set.total_rows}),
+        .pageToken = if (window.next < set.total_rows)
+            try std.fmt.allocPrint(arena, "{d}", .{window.next})
+        else
+            null,
+        .rows = rows,
+    }, response.envelope_options);
+    try out.appendSlice(arena, body);
+}
+
 /// Runs a query and serializes the full jobs.query response.
 ///
 /// The Rows is drained and deinited before returning, because Rows.deinit
@@ -477,6 +512,44 @@ pub fn runQueryFormatted(
     /// top-level TIMESTAMP column exists, so a later reader can choose.
     want_int64_timestamps: bool,
 ) !RunResult {
+    const collected = try collectResultSet(arena, db, sql, params);
+    const set = collected.set orelse return collected;
+
+    // totalBytesProcessed/Billed is the length of each rendered cell string
+    var total_bytes: usize = 0;
+    const counter = try set.renderer(arena, false);
+    for (0..set.total_rows) |row| {
+        total_bytes += response.renderedByteLen(try counter.row(row));
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    try writeResultSet(
+        arena,
+        &out,
+        .jobs_query,
+        project_id,
+        job_id,
+        set,
+        .{},
+        want_int64_timestamps,
+    );
+
+    return .{
+        .body = try out.toOwnedSlice(arena),
+        .set = set,
+        .ok = true,
+        .total_bytes = total_bytes,
+    };
+}
+
+/// Runs a statement and keeps every row it yields in storage form. A failed run carries its
+/// error body and status and no set; a successful one carries an empty body.
+pub fn collectResultSet(
+    arena: std.mem.Allocator,
+    db: *driver.Db,
+    sql: []const u8,
+    params: []const driver.Param,
+) !RunResult {
     var rows = db.query(sql, params, .{}) catch |err| switch (err) {
         // The engine's message is BigQuery's own, verbatim: no "failed to
         // analyze" prefix, and the API's 404 rather than a query error.
@@ -514,7 +587,6 @@ pub fn runQueryFormatted(
     // a later render decodes from -- so there is one representation instead of
     // the two this used to build whenever a TIMESTAMP column existed.
     var cells: std.ArrayList(encoder.SqliteRepr) = .empty;
-    var total_bytes: usize = 0;
     var total_rows: usize = 0;
     while (rows.nextRaw() catch |err| {
         // A failure partway through iteration still carries a message.
@@ -548,35 +620,7 @@ pub fn runQueryFormatted(
         .total_rows = total_rows,
         .outcome = rows.outcome,
     };
-
-    // totalBytesProcessed/Billed is the length of each rendered cell string,
-    // as the Go emulator counts it (convertValueToCell), so it has to be
-    // counted over the rendering rather than the storage form.
-    const counter = try set.renderer(arena, false);
-    for (0..total_rows) |row| {
-        total_bytes += response.renderedByteLen(try counter.row(row));
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    try writeResultSet(
-        arena,
-        &out,
-        .jobs_query,
-        project_id,
-        job_id,
-        set,
-        // jobs.query ignores maxResults entirely, as Go's does -- the whole
-        // result, in one response, with no token.
-        .{},
-        want_int64_timestamps,
-    );
-
-    return .{
-        .body = try out.toOwnedSlice(arena),
-        .set = set,
-        .ok = true,
-        .total_bytes = total_bytes,
-    };
+    return .{ .body = "", .set = set, .ok = true };
 }
 
 const testing = std.testing;
@@ -687,6 +731,27 @@ test "runQuery produces a jobs.query response" {
     ,
         res.body,
     );
+}
+
+test "a tabledata.list page carries the total and a token for the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var db = try driver.Db.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    const collected = try collectResultSet(
+        arena,
+        db,
+        "SELECT n FROM UNNEST([10, 20, 30]) AS n ORDER BY n",
+        &.{},
+    );
+    var out: std.ArrayList(u8) = .empty;
+    try writeTableDataList(arena, &out, collected.set.?, .{ .max_results = 2, .start = 1 }, false);
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"20"}]},{"f":[{"v":"30"}]}]}
+    , out.items);
 }
 
 test "a failing query yields the BigQuery error envelope" {

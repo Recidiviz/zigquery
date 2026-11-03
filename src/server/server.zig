@@ -385,6 +385,12 @@ pub const Server = struct {
                 m.captures.get(1),
                 m.captures.get(2),
             ),
+            .tabledata_list => s.handleTabledataList(
+                req,
+                m.captures.get(0),
+                m.captures.get(1),
+                m.captures.get(2),
+            ),
         };
     }
 
@@ -1185,6 +1191,61 @@ pub const Server = struct {
     /// Responds:
     /// 200 OK: batch was written; per-row errors may appear in `inserErrors`
     /// 500: internal engine failure
+    /// tabledata.list: a page of a table's rows. rest/v2/tabledata/list
+    fn handleTabledataList(
+        s: *Server,
+        req: *const http_server.Request,
+        project_id: []const u8,
+        dataset_id: []const u8,
+        table_id: []const u8,
+    ) !http_server.Response {
+        const arena = req.arena;
+        if (!try s.db.datasetExists(arena, project_id, dataset_id)) {
+            return datasetNotFound(arena, project_id, dataset_id);
+        }
+        if (try s.db.catalogTable(arena, project_id, dataset_id, table_id) == null) {
+            return notFound(arena, try std.fmt.allocPrint(
+                arena,
+                "Not found: Table {s}:{s}.{s}",
+                .{ project_id, dataset_id, table_id },
+            ));
+        }
+
+        const columns = if (req.queryParam("selectedFields")) |encoded|
+            selectedColumns(arena, encoded) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.InvalidFieldName => return badRequest(arena, "invalid selectedFields"),
+            }
+        else
+            "*";
+        const sql = try std.fmt.allocPrint(
+            arena,
+            "SELECT {s} FROM `{s}.{s}.{s}`",
+            .{ columns, project_id, dataset_id, table_id },
+        );
+        const collected = try query_handler.collectResultSet(arena, s.db, sql, &.{});
+        const set = collected.set orelse
+            return .{ .status = collected.status, .body = collected.body };
+
+        // startIndex applies when no pageToken resumes a read.
+        var page = query_handler.parseResultsPage(arena, req.query);
+        if (req.queryParam("pageToken") == null) {
+            if (req.queryParam("startIndex")) |text| {
+                page.start = std.fmt.parseInt(usize, text, 10) catch 0;
+            }
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        try query_handler.writeTableDataList(
+            arena,
+            &out,
+            set,
+            page,
+            query_handler.int64TimestampFromQuery(arena, req.query),
+        );
+        return .{ .body = out.items };
+    }
+
     fn handleTabledataInsertAll(
         s: *Server,
         req: *const http_server.Request,
@@ -2378,6 +2439,27 @@ pub const Server = struct {
         return .{ .body = out.items };
     }
 };
+
+/// The SELECT list for tabledata.list's selectedFields: comma-separated top-level column
+/// names, percent-encoded on the wire.
+fn selectedColumns(
+    arena: std.mem.Allocator,
+    encoded: []const u8,
+) error{ OutOfMemory, InvalidFieldName }![]const u8 {
+    const decoded = std.Uri.percentDecodeInPlace(try arena.dupe(u8, encoded));
+    var out: std.ArrayList(u8) = .empty;
+    var names = std.mem.splitScalar(u8, decoded, ',');
+    while (names.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " ");
+        if (name.len == 0) return error.InvalidFieldName;
+        for (name) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return error.InvalidFieldName;
+        }
+        if (out.items.len != 0) try out.appendSlice(arena, ", ");
+        try out.print(arena, "`{s}`", .{name});
+    }
+    return out.items;
+}
 
 fn notFound(arena: std.mem.Allocator, msg: []const u8) !http_server.Response {
     return .{ .status = .not_found, .body = try errors.body(arena, .not_found, msg) };
@@ -3743,6 +3825,71 @@ test "insertAll writes rows that a later query can read" {
     try testing.expectEqual(std.http.Status.ok, q.status);
     try testing.expect(std.mem.indexOf(u8, q.body, "{\"v\":\"Alice\"}") != null);
     try testing.expect(std.mem.indexOf(u8, q.body, "Bob") == null);
+}
+
+test "tabledata.list pages a table's rows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try createStreamTable(s, arena, "streamed");
+    const insert = try request(s, arena, .POST, "/projects/test/datasets/ds1/tables/streamed/insertAll",
+        \\{"rows":[{"json":{"name":"Alice","age":30}},{"json":{"name":"Bob","age":25}},
+        \\ {"json":{"name":"Carol","age":41}}]}
+    );
+    try testing.expectEqual(std.http.Status.ok, insert.status);
+
+    const first = try requestQuery(
+        s,
+        arena,
+        .GET,
+        "/projects/test/datasets/ds1/tables/streamed/data",
+        "maxResults=2",
+        "",
+    );
+    try testing.expectEqual(std.http.Status.ok, first.status);
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","pageToken":"2","rows":[{"f":[{"v":"Alice"},{"v":"30"}]},{"f":[{"v":"Bob"},{"v":"25"}]}]}
+    , first.body);
+
+    const rest = try requestQuery(
+        s,
+        arena,
+        .GET,
+        "/projects/test/datasets/ds1/tables/streamed/data",
+        "maxResults=2&pageToken=2",
+        "",
+    );
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"Carol"},{"v":"41"}]}]}
+    , rest.body);
+
+    const selected = try requestQuery(
+        s,
+        arena,
+        .GET,
+        "/projects/test/datasets/ds1/tables/streamed/data",
+        "selectedFields=age&startIndex=1",
+        "",
+    );
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"25"}]},{"f":[{"v":"41"}]}]}
+    , selected.body);
+}
+
+test "tabledata.list on a missing table is a 404" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .GET, "/projects/test/datasets/ds1/tables/absent/data", "");
+    try testing.expectEqual(std.http.Status.not_found, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "Not found: Table test:ds1.absent") != null);
 }
 
 test "posted table fields survive a round trip, and patch merges over them" {
