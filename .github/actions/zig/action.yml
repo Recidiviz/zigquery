@@ -3,10 +3,10 @@ description: >
   Install Zig and make its global cache usable for .zip dependencies.
 
 inputs:
-  version:
-    description: Zig version to install
+  build-zig-zon:
+    description: The build.zig.zon whose minimum_zig_version names the Zig to install
     required: false
-    default: "0.17.0"
+    default: build.zig.zon
   cache-size-limit:
     # A release build of the server leaves 3.3-3.8 GB in .zig-cache. When the
     # directory exceeds this limit setup-zig saves an empty cache, and every
@@ -18,9 +18,23 @@ inputs:
 runs:
   using: composite
   steps:
+    - id: version
+      shell: bash
+      env:
+        ZON: ${{ inputs.build-zig-zon }}
+      run: |
+        set -euo pipefail
+        version=$(sed -n 's/^[[:space:]]*\.minimum_zig_version = "\(.*\)",.*$/\1/p' "$ZON")
+        if [ -z "$version" ]; then
+          echo "::error::no minimum_zig_version in $ZON"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "zig $version from $ZON"
+
     - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       with:
-        version: ${{ inputs.version }}
+        version: ${{ steps.version.outputs.version }}
         cache-size-limit: ${{ inputs.cache-size-limit }}
 
     # Zig 0.16 stages a .zip dependency through <global-cache>/tmp but does

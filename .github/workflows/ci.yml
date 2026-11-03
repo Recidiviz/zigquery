@@ -12,9 +12,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  ZIG_VERSION: "0.17.0"
-
 jobs:
   shim:
     name: shim (linux-x64)
@@ -38,8 +35,6 @@ jobs:
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       # ephor's ZA601 already runs `zig fmt --check` over src/; these are the
       # trees its path_dir does not reach, less the ephor sources and cache that
@@ -53,7 +48,7 @@ jobs:
       # project's, so its package runs directly rather than through `zig build ephor`.
       - uses: ./.github/actions/zig
         with:
-          version: "0.16.0"
+          build-zig-zon: tools/ephor/build.zig.zon
 
       - name: ephor
         run: zig build --build-file tools/ephor/build.zig run -- --summary --fail-on=note
@@ -75,8 +70,6 @@ jobs:
         with:
           platform: linux-x64
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
       - run: zig build test -Dshim-dylib=${{ steps.shim.outputs.path }}
       - run: zig build test-server -Dshim-dylib=${{ steps.shim.outputs.path }}
 
@@ -97,8 +90,6 @@ jobs:
         with:
           platform: linux-x64
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       # --strict is what makes this a real gate: without it the runner exits
       # nonzero only on a baseline regression, so a case that has never passed
@@ -138,8 +129,6 @@ jobs:
         with:
           platform: linux-x64
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
       - run: zig build analyzer-threads -Drelease=true -Dshim-dylib=${{ steps.shim.outputs.path }}
       - run: zig build shared-catalog-threads -Drelease=true -Dshim-dylib=${{ steps.shim.outputs.path }}
       # Same contract: the Storage Read transport answers UNIMPLEMENTED, and
@@ -171,8 +160,6 @@ jobs:
         with:
           platform: linux-x64
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       # Staged outside the checkout: the Dockerfile copies dist/bin/, and a
       # context rooted at the repo would also carry dist/shim/ (~150 MB of
@@ -218,8 +205,6 @@ jobs:
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
       - run: zig build gen-proto
       - name: check for drift
         run: |
@@ -259,8 +244,6 @@ jobs:
         with:
           platform: linux-arm64
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
       - run: >-
           zig build dist -Drelease=true
           -Dshim-dylib=${{ steps.shim.outputs.path }}

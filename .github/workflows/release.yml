@@ -14,7 +14,6 @@ permissions:
   packages: write
 
 env:
-  ZIG_VERSION: "0.17.0"
   REGISTRY: ghcr.io
 
 jobs:
@@ -203,8 +202,6 @@ jobs:
         with:
           platform: ${{ matrix.platform }}
       - uses: ./.github/actions/zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       # `dist` installs only the two products, statically linked against the
       # shim, which is exactly the shipped tree — `install` would drag in
