@@ -48,6 +48,11 @@ pub const table = [_]Entry{
     route(.DELETE, tables_one, .tables_delete, Server.handleTablesDelete),
     route(.GET, tables_one ++ "/data", .tabledata_list, Server.handleTabledataList),
     route(.POST, tables_one ++ "/insertAll", .tabledata_insert_all, Server.handleTabledataInsertAll),
+    route(.POST, "/projects/:project/queries", .jobs_query, Server.handleQuery),
+    route(.GET, "/projects/:project/queries/:job", .jobs_get_query_results, Server.handleGetQueryResults),
+    route(.POST, "/projects/:project/jobs", .jobs_insert, Server.handleJobsInsert),
+    route(.GET, "/projects/:project/jobs", .jobs_list, Server.handleJobsList),
+    route(.GET, "/projects/:project/jobs/:job", .jobs_get, Server.handleJobsGet),
 };
 
 /// Every entry of `table` under each prefix it is registered at, path included.
@@ -267,6 +272,39 @@ test "a table literally named insertAll is a table GET" {
     try testing.expectEqual(
         RouteId.tables_get,
         (try matchedId(arena_state.allocator(), .GET, "/projects/p/datasets/ds/tables/insertAll")).?,
+    );
+}
+
+test "params bind by name and arrive percent-decoded" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var dreq: dusty.Request = undefined;
+    // BigQuery decodes path ids: tables/t%5Fx answers for table t_x.
+    const e = (try match(arena_state.allocator(), .GET, "/projects/p/datasets/d/tables/t%5Fx", &dreq)).?;
+    try testing.expectEqual(RouteId.tables_get, e.id);
+    try testing.expectEqualStrings("p", dreq.params.get("project").?);
+    try testing.expectEqualStrings("d", dreq.params.get("dataset").?);
+    try testing.expectEqualStrings("t_x", dreq.params.get("table").?);
+}
+
+test "the same path under different methods is different routes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqual(RouteId.jobs_insert, (try matchedId(arena, .POST, "/projects/p/jobs")).?);
+    try testing.expectEqual(RouteId.jobs_list, (try matchedId(arena, .GET, "/projects/p/jobs")).?);
+}
+
+test "a missing id or an extra segment matches nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .DELETE, "/projects/p/queries"));
+    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/projects//queries"));
+    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/projects/p"));
+    try testing.expectEqual(
+        @as(?RouteId, null),
+        try matchedId(arena, .GET, "/projects/p/queries/job/extra"),
     );
 }
 

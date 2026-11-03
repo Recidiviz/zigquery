@@ -69,11 +69,6 @@ pub const Route = struct {
 
 /// The implemented surface.
 pub const routes = [_]Route{
-    .{ .id = .jobs_query, .method = .POST, .pattern = "/projects/*/queries" },
-    .{ .id = .jobs_get_query_results, .method = .GET, .pattern = "/projects/*/queries/*" },
-    .{ .id = .jobs_insert, .method = .POST, .pattern = "/projects/*/jobs" },
-    .{ .id = .jobs_list, .method = .GET, .pattern = "/projects/*/jobs" },
-    .{ .id = .jobs_get, .method = .GET, .pattern = "/projects/*/jobs/*" },
 
     // The media upload endpoint. The discovery document gives the resumable protocol its own
     // `/resumable` prefix while the prose uses `/upload` with `uploadType=resumable`, so both
@@ -157,54 +152,6 @@ fn matchPattern(pattern: []const u8, path: []const u8, captures: *Captures) bool
 }
 
 const testing = std.testing;
-
-test "captures bind positionally regardless of discovery-doc spelling" {
-    const out = match(.POST, "/projects/my-project/queries");
-    try testing.expectEqual(Route.Id.jobs_query, out.matched.route);
-    try testing.expectEqual(@as(usize, 1), out.matched.captures.len);
-    try testing.expectEqualStrings("my-project", out.matched.captures.get(0));
-}
-
-test "two captures in path order" {
-    const out = match(.GET, "/projects/p1/queries/job-abc");
-    try testing.expectEqual(Route.Id.jobs_get_query_results, out.matched.route);
-    try testing.expectEqualStrings("p1", out.matched.captures.get(0));
-    try testing.expectEqualStrings("job-abc", out.matched.captures.get(1));
-}
-
-test "every route is reachable under the /bigquery/v2 prefix too" {
-    const bare = match(.POST, "/projects/p/queries");
-    const prefixed = match(.POST, "/bigquery/v2/projects/p/queries");
-    try testing.expectEqual(bare.matched.route, prefixed.matched.route);
-    try testing.expectEqualStrings("p", prefixed.matched.captures.get(0));
-}
-
-test "same path, different methods, different routes" {
-    try testing.expectEqual(Route.Id.jobs_insert, match(.POST, "/projects/p/jobs").matched.route);
-    try testing.expectEqual(Route.Id.jobs_list, match(.GET, "/projects/p/jobs").matched.route);
-}
-
-test "unmatched method on a known path is not a 404" {
-    try testing.expectEqual(Outcome.method_not_allowed, match(.DELETE, "/projects/p/queries"));
-    try testing.expectEqual(Outcome.not_found, match(.GET, "/no/such/path"));
-}
-
-test "captures reject empty segments and extra depth" {
-    try testing.expectEqual(Outcome.not_found, match(.POST, "/projects//queries"));
-    try testing.expectEqual(Outcome.not_found, match(.POST, "/projects/p"));
-    try testing.expectEqual(Outcome.not_found, match(.GET, "/projects/p/queries/job/extra"));
-
-    // Not a 404: /projects/*/queries/* is a real route, just a GET one.
-    try testing.expectEqual(
-        Outcome.method_not_allowed,
-        match(.POST, "/projects/p/queries/extra"),
-    );
-}
-
-test "trailing slash does not match" {
-    // gorilla/mux is strict by default; a trailing slash is a different path.
-    try testing.expectEqual(Outcome.not_found, match(.POST, "/projects/p/queries/"));
-}
 
 test "all declared routes match their own patterns" {
     // Guards against a pattern that can never be reached.

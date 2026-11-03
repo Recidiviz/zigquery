@@ -348,6 +348,15 @@ pub const Server = struct {
         return dispatch(s, req);
     }
 
+    /// jobs.list: not implemented, because listing needs the jobs metadata table.
+    pub fn handleJobsList(
+        _: *Server,
+        req: *const http_server.Request,
+        _: []const u8,
+    ) !http_server.Response {
+        return internalError(req.arena, "unsupported in this milestone: jobs.list");
+    }
+
     /// The discovery document, naming the bind address.
     pub fn handleDiscovery(s: *Server, req: *const http_server.Request) !http_server.Response {
         return discovery.handle(req.arena, s.endpoint);
@@ -384,32 +393,20 @@ pub const Server = struct {
             .tables_delete,
             .tabledata_list,
             .tabledata_insert_all,
+            .jobs_query,
+            .jobs_get_query_results,
+            .jobs_insert,
+            .jobs_list,
+            .jobs_get,
             => unreachable,
-            .jobs_query => s.handleQuery(req, m.captures.get(0)),
-            .jobs_get_query_results => s.handleGetQueryResults(
-                req,
-                m.captures.get(0),
-                m.captures.get(1),
-            ),
-            .jobs_insert => s.handleJobsInsert(req, m.captures.get(0)),
             .upload_jobs_insert => s.handleUploadInsert(req, m.captures.get(0)),
             .upload_jobs_resume => s.handleUploadResume(req, m.captures.get(0)),
-            .jobs_get => s.handleJobsGet(req, m.captures.get(0), m.captures.get(1)),
-            // Listing needs the jobs metadata table; deferred.
-            .jobs_list => .{
-                .status = .internal_server_error,
-                .body = try errors.body(
-                    req.arena,
-                    .internal_error,
-                    "unsupported in this milestone: jobs.list",
-                ),
-            },
 
         };
     }
 
     /// server/handler.go jobsQueryHandler.
-    fn handleQuery(
+    pub fn handleQuery(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -1368,7 +1365,7 @@ pub const Server = struct {
     /// This is the path real clients take: Client.query() posts here, polls
     /// jobs.get until DONE, then reads getQueryResults. Go runs the query
     /// synchronously so the job is DONE on return; same here.
-    fn handleJobsInsert(
+    pub fn handleJobsInsert(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -2498,7 +2495,7 @@ pub const Server = struct {
     }
 
     /// server/handler.go jobsGetHandler.
-    fn handleJobsGet(
+    pub fn handleJobsGet(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -2510,7 +2507,7 @@ pub const Server = struct {
     }
 
     /// server/handler.go jobsGetQueryResultsHandler.
-    fn handleGetQueryResults(
+    pub fn handleGetQueryResults(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
