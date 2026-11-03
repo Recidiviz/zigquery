@@ -1393,7 +1393,7 @@ pub const Server = struct {
         return switch (jobConfigKind(job)) {
             .query => s.handleQueryJob(arena, req, project_id, job_id, job),
             .copy => s.handleCopyConfig(arena, project_id, job_id, job),
-            .load => s.handleLoadConfig(arena, req, project_id, job),
+            .load => s.handleLoadConfig(arena, project_id, job_id, job),
             .extract => badRequest(arena, "configuration.extract is not supported"),
             .none => badRequest(
                 arena,
@@ -1481,11 +1481,10 @@ pub const Server = struct {
     fn handleLoadConfig(
         s: *Server,
         arena: std.mem.Allocator,
-        req: *const http_server.Request,
         project_id: []const u8,
+        job_id: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
-        _ = req;
         const parsed = load_handler.parse(job) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return badRequest(arena, load_handler.parseErrorMessage(err)),
@@ -1497,7 +1496,7 @@ pub const Server = struct {
                 "configuration.load needs sourceUris, or its data sent to the upload endpoint",
             );
         }
-        return s.runLoad(arena, project_id, job, spec, .uris);
+        return s.runLoad(arena, project_id, job_id, spec, .uris);
     }
 
     // ---- the media upload endpoint ----
@@ -1652,7 +1651,11 @@ pub const Server = struct {
                 "an upload carries its data, so configuration.load.sourceUris must be empty",
             );
         }
-        return s.runLoad(arena, project_id, job, spec, .{ .media = media });
+        const job_id = switch (try s.claimJobId(arena, project_id, job)) {
+            .id => |id| id,
+            .refused => |response| return response,
+        };
+        return s.runLoad(arena, project_id, job_id, spec, .{ .media = media });
     }
 
     /// Where a load job's bytes come from.
@@ -1674,7 +1677,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
-        job: *const pb.Job,
+        job_id: []const u8,
         spec: load_handler.LoadSpec,
         data: LoadData,
     ) !http_server.Response {
@@ -1690,10 +1693,6 @@ pub const Server = struct {
             dst.table_id,
         );
 
-        const job_id = switch (try s.claimJobId(arena, project_id, job)) {
-            .id => |id| id,
-            .refused => |response| return response,
-        };
         const unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000);
 
         // CREATE_NEVER reports a missing destination in the job result.
@@ -1744,6 +1743,7 @@ pub const Server = struct {
                     .store = store,
                     .endpoint = s.storage_endpoint,
                     .limit = max_load_source_bytes,
+                    .deadline = .fromNow(s.io, .{ .raw = gcs.load_timeout, .clock = .awake }),
                 };
                 switch (try gcs.readSources(arena, reader, spec.source_uris)) {
                     .read => |objects| break :blk objects,
@@ -1761,9 +1761,15 @@ pub const Server = struct {
         var input_file_bytes: u64 = 0;
         for (sources) |source| input_file_bytes += source.len;
 
+        // An upload's unreadable bytes answer its request; a gs:// source's complete the job.
         const read = load_rows.readMany(arena, sources, spec, existing) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return badRequest(arena, load_rows.readErrorMessage(err)),
+            else => switch (data) {
+                .media => return badRequest(arena, load_rows.readErrorMessage(err)),
+                .uris => return s.storeLoadJob(arena, project_id, job_id, spec, unix_seconds, .{
+                    .failed = .{ .reason = "invalid", .message = load_rows.readErrorMessage(err) },
+                }),
+            },
         };
 
         const tooManyBadRecords = struct {
@@ -5988,6 +5994,33 @@ test "a gs:// load reads its objects from the configured storage" {
         \\{"query":"SELECT COUNT(*) FROM `test.ds1.people`","useLegacySql":false}
     );
     try testing.expectEqualStrings("2", try onlyCell(arena, count.body));
+}
+
+test "a gs:// object that cannot be read as its format fails the job, not the request" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    var memory: gcs.MemoryStore = .{ .arena = arena };
+    const storage = memory.store();
+    const object: gcs.Uri = .{ .bucket = "staging", .object = "people.json" };
+    try storage.put(arena, object, "[1, 2, 3]\n");
+    s.storage = storage;
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"jobReference":{"jobId":"bad_json_load"},
+        \\ "configuration":{"load":{"sourceUris":["gs://staging/people.json"],
+        \\ "sourceFormat":"NEWLINE_DELIMITED_JSON","autodetect":true,
+        \\ "destinationTable":{"projectId":"test","datasetId":"ds1","tableId":"people"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"errorResult\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "must be an object") != null);
+
+    const got = try request(s, arena, .GET, "/projects/test/jobs/bad_json_load", "");
+    try testing.expectEqual(std.http.Status.ok, got.status);
 }
 
 test "a gs:// load with no storage configured fails the job, naming the setting" {

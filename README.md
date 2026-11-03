@@ -52,7 +52,8 @@ as [fake-gcs-server](https://github.com/fsouza/fake-gcs-server), never from real
 Point the emulator at it with `STORAGE_EMULATOR_HOST`, the variable the Google client libraries
 already read, or with `--storage-emulator-host`. A URI may hold one `*` wildcard, and each
 matching object is read in name order. CSV and newline-delimited JSON are supported, up to
-256 MiB per load job.
+256 MiB per load job. Each request to the storage emulator has 30 seconds, and reading all of a
+load job's sources has 120; the server answers no other request while a load reads.
 
 ```yaml
 services:

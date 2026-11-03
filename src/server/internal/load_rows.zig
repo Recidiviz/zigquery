@@ -33,6 +33,8 @@ pub const Reading = struct {
     source: Source,
     /// Records rejected before any row was built.
     bad_records: u64,
+    /// Leading rows a CSV source skipped before its data; zero for NEWLINE_DELIMITED_JSON.
+    data_start: usize = 0,
 
     pub fn rowCount(r: Reading) usize {
         return switch (r.source) {
@@ -59,11 +61,11 @@ pub fn readErrorMessage(err: Error) []const u8 {
     return switch (err) {
         error.NoSchema => "the load names no schema: supply one, enable autodetect, or " ++
             "load into an existing table",
-        error.NotAnObject => "every line of a NEWLINE_DELIMITED_JSON upload must be an object",
+        error.NotAnObject => "every line of NEWLINE_DELIMITED_JSON data must be an object",
         error.NestedJson => "nested and repeated fields are not read from " ++
             "NEWLINE_DELIMITED_JSON",
-        error.MalformedJson => "the upload is not newline-delimited JSON",
-        error.MalformedCsv => "the upload is not readable as CSV",
+        error.MalformedJson => "the data is not newline-delimited JSON",
+        error.MalformedCsv => "the data is not readable as CSV",
         error.OutOfMemory => "out of memory",
     };
 }
@@ -74,11 +76,14 @@ pub fn read(
     spec: load_handler.LoadSpec,
     existing: ?*const spec_mod.TableSpec,
 ) Error!Reading {
-    return readOne(arena, media, spec, try declaredColumns(arena, spec, existing));
+    return readOne(arena, media, spec, .{ .columns = try declaredColumns(arena, spec, existing) });
 }
 
-/// Reads several sources as one load. The first decides the columns, as a single source does;
-/// the rest are read under those columns, each skipping its own leading rows.
+/// Reads several sources as one load, each source's rows in source order.
+///
+/// The first source with any content settles the columns and, for CSV, how many leading rows
+/// every source skips, as a single source would on its own. The others are read under those,
+/// so a shard holding only a header row yields no rows and an empty shard says nothing.
 pub fn readMany(
     arena: std.mem.Allocator,
     sources: []const []const u8,
@@ -86,45 +91,57 @@ pub fn readMany(
     existing: ?*const spec_mod.TableSpec,
 ) Error!Reading {
     std.debug.assert(sources.len != 0);
-    var reading = try readOne(arena, sources[0], spec, try declaredColumns(arena, spec, existing));
+    const leader = firstWithContent(sources);
+    var reading = try readOne(arena, sources[leader], spec, .{
+        .columns = try declaredColumns(arena, spec, existing),
+    });
     if (sources.len == 1) return reading;
 
-    switch (reading.source) {
-        .csv => |first| {
-            var rows: std.ArrayList(csv.Row) = .empty;
-            try rows.appendSlice(arena, first);
-            for (sources[1..]) |media| {
-                const next = try readOne(arena, media, spec, reading.columns);
-                try rows.appendSlice(arena, next.source.csv);
-                reading.bad_records += next.bad_records;
-            }
-            reading.source = .{ .csv = rows.items };
-        },
-        .json => |first| {
-            var rows: std.ArrayList(std.json.Value) = .empty;
-            try rows.appendSlice(arena, first);
-            for (sources[1..]) |media| {
-                const next = try readOne(arena, media, spec, reading.columns);
-                try rows.appendSlice(arena, next.source.json);
-                reading.bad_records += next.bad_records;
-            }
-            reading.source = .{ .json = rows.items };
-        },
+    const settled: Settled = .{ .columns = reading.columns, .data_start = reading.data_start };
+    var csv_rows: std.ArrayList(csv.Row) = .empty;
+    var json_rows: std.ArrayList(std.json.Value) = .empty;
+    var bad_records: u64 = 0;
+    for (sources, 0..) |media, i| {
+        const part = if (i == leader) reading else try readOne(arena, media, spec, settled);
+        switch (part.source) {
+            .csv => |rows| try csv_rows.appendSlice(arena, rows),
+            .json => |rows| try json_rows.appendSlice(arena, rows),
+        }
+        bad_records += part.bad_records;
     }
+    reading.bad_records = bad_records;
+    reading.source = switch (reading.source) {
+        .csv => .{ .csv = csv_rows.items },
+        .json => .{ .json = json_rows.items },
+    };
     return reading;
 }
 
-/// Args:
-///   declared: the columns the source is read under, or null to detect them from it.
+/// The index of the first source holding anything but whitespace, or 0 when none does.
+fn firstWithContent(sources: []const []const u8) usize {
+    for (sources, 0..) |media, i| {
+        if (std.mem.trim(u8, media, " \t\r\n").len != 0) return i;
+    }
+    return 0;
+}
+
+/// What an earlier source of the same load settled for the ones read after it.
+const Settled = struct {
+    /// The columns the source is read under. Null leaves them to the source to detect.
+    columns: ?[]const Column = null,
+    /// Leading CSV rows the source skips. Null leaves them to skipLeadingRows and autodetect.
+    data_start: ?usize = null,
+};
+
 fn readOne(
     arena: std.mem.Allocator,
     media: []const u8,
     spec: load_handler.LoadSpec,
-    declared: ?[]const Column,
+    settled: Settled,
 ) Error!Reading {
     return switch (spec.source_format) {
-        .CSV => readCsv(arena, media, spec, declared),
-        .NEWLINE_DELIMITED_JSON => readJson(arena, media, spec, declared),
+        .CSV => readCsv(arena, media, spec, settled),
+        .NEWLINE_DELIMITED_JSON => readJson(arena, media, spec, settled.columns),
     };
 }
 
@@ -215,7 +232,7 @@ fn readCsv(
     arena: std.mem.Allocator,
     media: []const u8,
     spec: load_handler.LoadSpec,
-    declared: ?[]const Column,
+    settled: Settled,
 ) Error!Reading {
     const parsed = csv.parse(arena, media, .{
         .field_delimiter = spec.field_delimiter,
@@ -223,16 +240,17 @@ fn readCsv(
         .allow_quoted_newlines = spec.allow_quoted_newlines,
     }) catch return error.MalformedCsv;
 
-    // Autodetect decides where the data starts even when the job supplied its own schema.
-    const detection: ?autodetect.Detection = if (spec.autodetect)
+    // Autodetect decides where the data starts even when the job supplied its own schema,
+    // unless an earlier source of the load already did.
+    const detection: ?autodetect.Detection = if (spec.autodetect and settled.data_start == null)
         try autodetect.detect(arena, try sampleTexts(arena, parsed, spec), spec.skip_leading_rows)
     else
         null;
-    const data_start: usize = if (detection) |d|
+    const data_start: usize = settled.data_start orelse if (detection) |d|
         d.data_start
     else if (spec.skip_leading_rows) |n| n else 0;
 
-    const columns = declared orelse
+    const columns = settled.columns orelse
         try detectedColumns(arena, detection orelse return error.NoSchema);
 
     const schema_node = try schemaNodeFrom(arena, columns);
@@ -244,6 +262,7 @@ fn readCsv(
         .columns = columns,
         .source = .{ .csv = data },
         .bad_records = 0,
+        .data_start = data_start,
     };
 }
 
@@ -679,6 +698,28 @@ test "bad records count across every source of a load" {
     }, spec, null);
     try testing.expectEqual(@as(usize, 2), reading.rowCount());
     try testing.expectEqual(@as(u64, 2), reading.bad_records);
+}
+
+test "an empty shard and a header-only shard do not unsettle an autodetected load" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spec: load_handler.LoadSpec = .{
+        .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
+        .autodetect = true,
+    };
+    const reading = try readMany(arena, &.{
+        "",
+        "person_id,district\n1,NORTH\n2,SOUTH\n",
+        "person_id,district\n",
+        "person_id,district\n3,EAST\n",
+    }, spec, null);
+    const collected = try collect(arena, reading, spec);
+    try testing.expectEqual(@as(u64, 0), collected.bad_records);
+    try testing.expectEqual(@as(usize, 3), collected.rows.len);
+    try testing.expectEqualStrings("INTEGER", (try columnTypes(arena, reading))[0]);
+    try testing.expectEqual(@as(i64, 3), collected.rows[2].object.get("person_id").?.integer);
 }
 
 test "every read error has a message of its own" {

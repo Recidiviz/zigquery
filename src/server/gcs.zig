@@ -21,6 +21,19 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// How long one request to the emulator may take.
+pub const request_timeout: Io.Duration = .fromSeconds(30);
+/// How long reading every source of one load job may take.
+pub const load_timeout: Io.Duration = .fromSeconds(120);
+
+/// What one read may spend.
+pub const Budget = struct {
+    /// The most bytes the answer may hold.
+    bytes: usize,
+    /// When the read is abandoned. Null leaves only the store's per-request timeout.
+    deadline: ?Io.Clock.Timestamp = null,
+};
+
 /// A bucket's objects. Load jobs get and list; extract jobs will put.
 pub const Store = struct {
     ptr: *anyopaque,
@@ -31,13 +44,13 @@ pub const Store = struct {
             ptr: *anyopaque,
             arena: std.mem.Allocator,
             object: Uri,
-            limit: usize,
+            budget: Budget,
         ) Error![]const u8,
         list: *const fn (
             ptr: *anyopaque,
             arena: std.mem.Allocator,
-            bucket: []const u8,
-            prefix: []const u8,
+            prefix: Uri,
+            deadline: ?Io.Clock.Timestamp,
         ) Error![]const []const u8,
         put: *const fn (
             ptr: *anyopaque,
@@ -47,19 +60,20 @@ pub const Store = struct {
         ) Error!void,
     };
 
-    /// The object's bytes, or TooLarge when there are more than `limit` of them.
-    pub fn get(s: Store, arena: std.mem.Allocator, object: Uri, limit: usize) Error![]const u8 {
-        return s.vtable.get(s.ptr, arena, object, limit);
+    /// The object's bytes, or TooLarge when there are more than the budget allows.
+    pub fn get(s: Store, arena: std.mem.Allocator, object: Uri, budget: Budget) Error![]const u8 {
+        return s.vtable.get(s.ptr, arena, object, budget);
     }
 
-    /// The names of the objects that start with `prefix`, in name order.
+    /// The names of the objects in `prefix.bucket` that start with `prefix.object`, in name
+    /// order.
     pub fn list(
         s: Store,
         arena: std.mem.Allocator,
-        bucket: []const u8,
-        prefix: []const u8,
+        prefix: Uri,
+        deadline: ?Io.Clock.Timestamp,
     ) Error![]const []const u8 {
-        return s.vtable.list(s.ptr, arena, bucket, prefix);
+        return s.vtable.list(s.ptr, arena, prefix, deadline);
     }
 
     pub fn put(s: Store, arena: std.mem.Allocator, object: Uri, bytes: []const u8) Error!void {
@@ -108,13 +122,18 @@ pub const HttpStore = struct {
     io: Io,
     /// A base URL, as endpointFrom gives it.
     endpoint: []const u8,
-    timeout: Io.Duration = .fromSeconds(30),
+    timeout: Io.Duration = request_timeout,
 
     pub fn store(h: *HttpStore) Store {
         return .{ .ptr = h, .vtable = &.{ .get = get, .list = list, .put = put } };
     }
 
-    fn get(ptr: *anyopaque, arena: std.mem.Allocator, object: Uri, limit: usize) Error![]const u8 {
+    fn get(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        object: Uri,
+        budget: Budget,
+    ) Error![]const u8 {
         const h: *HttpStore = @ptrCast(@alignCast(ptr));
         var url: std.ArrayList(u8) = .empty;
         try url.print(arena, "{s}/storage/v1/b/", .{h.endpoint});
@@ -123,7 +142,7 @@ pub const HttpStore = struct {
         try appendEscaped(arena, &url, object.object);
         try url.appendSlice(arena, "?alt=media");
 
-        const reply = try h.send(arena, url.items, limit);
+        const reply = try h.send(arena, url.items, budget);
         return switch (reply.status) {
             .ok => reply.body,
             .not_found => error.NotFound,
@@ -135,24 +154,25 @@ pub const HttpStore = struct {
     fn list(
         ptr: *anyopaque,
         arena: std.mem.Allocator,
-        bucket: []const u8,
-        prefix: []const u8,
+        prefix: Uri,
+        deadline: ?Io.Clock.Timestamp,
     ) Error![]const []const u8 {
         const h: *HttpStore = @ptrCast(@alignCast(ptr));
+        const budget: Budget = .{ .bytes = list_page_limit, .deadline = deadline };
         var names: std.ArrayList([]const u8) = .empty;
         var page_token: ?[]const u8 = null;
         while (true) {
             var url: std.ArrayList(u8) = .empty;
             try url.print(arena, "{s}/storage/v1/b/", .{h.endpoint});
-            try appendEscaped(arena, &url, bucket);
+            try appendEscaped(arena, &url, prefix.bucket);
             try url.appendSlice(arena, "/o?prefix=");
-            try appendEscaped(arena, &url, prefix);
+            try appendEscaped(arena, &url, prefix.object);
             if (page_token) |token| {
                 try url.appendSlice(arena, "&pageToken=");
                 try appendEscaped(arena, &url, token);
             }
 
-            const reply = try h.send(arena, url.items, list_page_limit);
+            const reply = try h.send(arena, url.items, budget);
             switch (reply.status) {
                 .ok => {},
                 .not_found => return error.NotFound,
@@ -175,19 +195,26 @@ pub const HttpStore = struct {
 
     const Reply = struct { status: std.http.Status, body: []const u8 };
 
-    /// One GET, abandoned when `timeout` passes first. The request runs as its own task so the
-    /// deadline covers connecting, waiting and reading alike.
-    fn send(h: *HttpStore, arena: std.mem.Allocator, url: []const u8, limit: usize) Error!Reply {
+    /// One GET, abandoned at `timeout` or the budget's deadline, whichever comes first. The
+    /// request and its timer each run as their own task, so the deadline covers connecting,
+    /// waiting and reading alike. Where the Io cannot run them concurrently the request runs
+    /// without a deadline.
+    fn send(h: *HttpStore, arena: std.mem.Allocator, url: []const u8, budget: Budget) Error!Reply {
         const Outcome = union(enum) {
             reply: Error!Reply,
             expired: Io.Cancelable!void,
         };
+        const own: Io.Clock.Timestamp = .fromNow(h.io, .{ .raw = h.timeout, .clock = .awake });
+        const deadline = if (budget.deadline) |d| (if (d.compare(.lt, own)) d else own) else own;
+
         var buffer: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(h.io, &buffer);
         defer select.cancelDiscard();
-        select.concurrent(.reply, fetch, .{ h, arena, url, limit }) catch
-            return fetch(h, arena, url, limit);
-        select.async(.expired, Io.sleep, .{ h.io, h.timeout, .awake });
+        const timer: Io.Timeout = .{ .deadline = deadline };
+        select.concurrent(.expired, Io.Timeout.sleep, .{ timer, h.io }) catch
+            return fetch(h, arena, url, budget.bytes);
+        select.concurrent(.reply, fetch, .{ h, arena, url, budget.bytes }) catch
+            return fetch(h, arena, url, budget.bytes);
         const first = select.await() catch return error.TimedOut;
         return switch (first) {
             .reply => |reply| reply,
@@ -202,12 +229,14 @@ pub const HttpStore = struct {
         var request = client.request(.GET, uri, .{
             .keep_alive = false,
             .redirect_behavior = .unhandled,
-            // The bytes as stored, not a compressed transfer of them.
+            // The bytes as stored.
             .headers = .{ .accept_encoding = .omit },
         }) catch |err| return transportError(err);
         defer request.deinit();
         request.sendBodiless() catch |err| return transportError(err);
         var response = request.receiveHead(&.{}) catch |err| return transportError(err);
+        // Only an object or a listing is read; the status alone says what anything else means.
+        if (response.head.status != .ok) return .{ .status = response.head.status, .body = "" };
 
         var transfer: [4096]u8 = undefined;
         const body = response.reader(&transfer).allocRemaining(arena, .limited(limit)) catch |err|
@@ -272,27 +301,35 @@ pub const MemoryStore = struct {
         return std.fmt.allocPrint(m.arena, "{s}/{s}", .{ object.bucket, object.object });
     }
 
-    fn get(ptr: *anyopaque, arena: std.mem.Allocator, object: Uri, limit: usize) Error![]const u8 {
+    fn get(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        object: Uri,
+        budget: Budget,
+    ) Error![]const u8 {
         _ = arena;
         const m: *MemoryStore = @ptrCast(@alignCast(ptr));
         if (m.failure) |err| return err;
         const bytes = m.objects.get(try m.key(object)) orelse return error.NotFound;
-        if (bytes.len > limit) return error.TooLarge;
+        if (bytes.len > budget.bytes) return error.TooLarge;
         return bytes;
     }
 
     fn list(
         ptr: *anyopaque,
         arena: std.mem.Allocator,
-        bucket: []const u8,
-        prefix: []const u8,
+        prefix: Uri,
+        deadline: ?Io.Clock.Timestamp,
     ) Error![]const []const u8 {
+        _ = deadline;
         const m: *MemoryStore = @ptrCast(@alignCast(ptr));
         if (m.failure) |err| return err;
-        const start = try m.key(.{ .bucket = bucket, .object = prefix });
+        const start = try m.key(prefix);
         var names: std.ArrayList([]const u8) = .empty;
         for (m.objects.keys()) |k| {
-            if (std.mem.startsWith(u8, k, start)) try names.append(arena, k[bucket.len + 1 ..]);
+            if (std.mem.startsWith(u8, k, start)) {
+                try names.append(arena, k[prefix.bucket.len + 1 ..]);
+            }
         }
         std.mem.sort([]const u8, names.items, {}, lessThan);
         return names.items;
@@ -323,6 +360,8 @@ pub const Reader = struct {
     endpoint: []const u8,
     /// The most bytes read across every source of one load.
     limit: usize,
+    /// When reading the sources is abandoned.
+    deadline: ?Io.Clock.Timestamp = null,
 };
 
 /// Reads every object `uris` names, gs:// URIs that Uri.parse accepts.
@@ -341,7 +380,8 @@ pub fn readSources(
 
         var names: []const []const u8 = &.{uri.object};
         if (uri.wildcard()) |w| {
-            const listed = reader.store.list(arena, uri.bucket, w.prefix) catch |err|
+            const prefix: Uri = .{ .bucket = uri.bucket, .object = w.prefix };
+            const listed = reader.store.list(arena, prefix, reader.deadline) catch |err|
                 return failure(arena, err, text, reader);
             var matched: std.ArrayList([]const u8) = .empty;
             for (listed) |name| {
@@ -354,7 +394,8 @@ pub fn readSources(
 
         for (names) |name| {
             const object: Uri = .{ .bucket = uri.bucket, .object = name };
-            const bytes = reader.store.get(arena, object, reader.limit - total) catch |err| {
+            const budget: Budget = .{ .bytes = reader.limit - total, .deadline = reader.deadline };
+            const bytes = reader.store.get(arena, object, budget) catch |err| {
                 const shown = try std.fmt.allocPrint(arena, "gs://{s}/{s}", .{ uri.bucket, name });
                 return failure(arena, err, shown, reader);
             };
@@ -391,8 +432,9 @@ fn failure(
             .reason = "backendError",
             .message = try std.fmt.allocPrint(
                 arena,
-                "The Cloud Storage emulator at {s} did not answer in time for {s}",
-                .{ endpoint, uri },
+                "The Cloud Storage emulator at {s} did not answer in time for {s}: each " ++
+                    "request has {d} s, and a load job's sources {d} s",
+                .{ endpoint, uri, request_timeout.toSeconds(), load_timeout.toSeconds() },
             ),
         },
         error.Unreachable => .{
@@ -540,6 +582,104 @@ test "an unreachable emulator fails the read and names its address" {
     try testing.expect(std.mem.indexOf(u8, got.failed.message, "http://fake-gcs:4443") != null);
 }
 
+/// Answers the first request on `listener` with `reply`, once the request's head has arrived.
+fn answerOnce(io: Io, listener: *Io.net.Server, reply: []const u8) !void {
+    const stream = try listener.accept(io);
+    defer stream.close(io);
+    var in_buffer: [4096]u8 = undefined;
+    var in = stream.reader(io, &in_buffer);
+    while ((try in.interface.takeDelimiterInclusive('\n')).len > 2) {}
+    var out_buffer: [256]u8 = undefined;
+    var out = stream.writer(io, &out_buffer);
+    try out.interface.writeAll(reply);
+    try out.interface.flush();
+}
+
+/// A store reading from a listener on a free local port.
+fn localStore(arena: std.mem.Allocator, io: Io, listener: *Io.net.Server) !HttpStore {
+    return .{
+        .gpa = testing.allocator,
+        .io = io,
+        .endpoint = try std.fmt.allocPrint(
+            arena,
+            "http://127.0.0.1:{d}",
+            .{listener.socket.address.getPort()},
+        ),
+    };
+}
+
+test "a not-found answer is not held against the byte budget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+
+    const reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 64\r\nConnection: close\r\n\r\n" ++
+        "{\"error\":{\"code\":404,\"message\":\"No such object: staging/a.csv\"}}";
+    var served = try io.concurrent(answerOnce, .{ io, &listener, reply });
+    defer served.cancel(io) catch {};
+
+    var http = try localStore(arena, io, &listener);
+    const object: Uri = .{ .bucket = "staging", .object = "a.csv" };
+    try testing.expectError(error.NotFound, http.store().get(arena, object, .{ .bytes = 8 }));
+}
+
+test "a quick answer is not held to the deadline when the Io runs nothing asynchronously" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A pool with no room for asynchronous tasks runs them in place, as a busy server's does.
+    var threaded: Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+
+    const reply = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1,NORTH\n";
+    var served = try io.concurrent(answerOnce, .{ io, &listener, reply });
+    defer served.cancel(io) catch {};
+
+    var http = try localStore(arena, io, &listener);
+    http.timeout = .fromSeconds(5);
+    const object: Uri = .{ .bucket = "staging", .object = "a.csv" };
+    const started = Io.Clock.awake.now(io);
+    const body = try http.store().get(arena, object, .{ .bytes = 1024 });
+    try testing.expectEqualStrings("1,NORTH\n", body);
+    try testing.expect(started.untilNow(io, .awake).toSeconds() < 2);
+}
+
+test "the load's deadline cuts a request short of its own timeout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+
+    // The store keeps its 30 s per-request timeout; the budget's deadline is what ends this.
+    var http = try localStore(arena, io, &listener);
+    const object: Uri = .{ .bucket = "staging", .object = "a.csv" };
+    const budget: Budget = .{
+        .bytes = 1024,
+        .deadline = .fromNow(io, .{ .raw = .fromMilliseconds(200), .clock = .awake }),
+    };
+    const started = Io.Clock.awake.now(io);
+    try testing.expectError(error.TimedOut, http.store().get(arena, object, budget));
+    try testing.expect(started.untilNow(io, .awake).toSeconds() < 5);
+}
+
 test "an emulator that accepts and never answers times out" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -567,7 +707,7 @@ test "an emulator that accepts and never answers times out" {
         .timeout = .fromMilliseconds(200),
     };
     const object: Uri = .{ .bucket = "staging", .object = "a.csv" };
-    try testing.expectError(error.TimedOut, http.store().get(arena, object, 1024));
+    try testing.expectError(error.TimedOut, http.store().get(arena, object, .{ .bytes = 1024 }));
 }
 
 test "an HTTP store against a closed port is unreachable, not a hang" {
@@ -582,5 +722,5 @@ test "an HTTP store against a closed port is unreachable, not a hang" {
         .endpoint = "http://127.0.0.1:1",
     };
     const object: Uri = .{ .bucket = "staging", .object = "a.csv" };
-    try testing.expectError(error.Unreachable, http.store().get(arena, object, 1024));
+    try testing.expectError(error.Unreachable, http.store().get(arena, object, .{ .bytes = 1024 }));
 }
