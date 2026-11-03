@@ -7,6 +7,13 @@ inputs:
     description: Zig version to install
     required: false
     default: "0.17.0-dev.2131+d08989840"
+  cache-size-limit:
+    # A release build of the server leaves 3.3-3.8 GB in .zig-cache. When the
+    # directory exceeds this limit setup-zig saves an empty cache, and every
+    # later run compiles from scratch.
+    description: Largest Zig cache directory, in MiB, that setup-zig will save
+    required: false
+    default: "6144"
 
 runs:
   using: composite
@@ -14,6 +21,7 @@ runs:
     - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
       with:
         version: ${{ inputs.version }}
+        cache-size-limit: ${{ inputs.cache-size-limit }}
 
     # Zig 0.16 stages a .zip dependency through <global-cache>/tmp but does
     # not create that directory, so on a cache that has never held one the
