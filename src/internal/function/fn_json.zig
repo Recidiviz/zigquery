@@ -290,7 +290,7 @@ fn scalarText(alloc: std.mem.Allocator, v: std.json.Value) Error![]const u8 {
         .integer => |i| try std.fmt.allocPrint(alloc, "{d}", .{i}),
         .float => |f| blk: {
             var buf: [32]u8 = undefined;
-            break :blk try alloc.dupe(u8, value_mod.formatFloatGo(&buf, f));
+            break :blk try alloc.dupe(u8, value_mod.formatFloatShortest(&buf, f));
         },
         .bool => |b| if (b) "true" else "false",
         .null => "null",
@@ -476,7 +476,7 @@ pub fn toJson(alloc: std.mem.Allocator, args: []const Value) Error!Value {
     if (args.len != 1 and args.len != 2)
         return bind.fail("TO_JSON: invalid argument num {d}", .{args.len}, error.UnsupportedOperation);
     if (bind.existsNull(args)) return null_v;
-    return Value{ .json = try args[0].toJson(alloc) };
+    return Value{ .json = try args[0].toJson(alloc, .json) };
 }
 
 pub fn toJsonString(alloc: std.mem.Allocator, args: []const Value) Error!Value {
@@ -486,7 +486,7 @@ pub fn toJsonString(alloc: std.mem.Allocator, args: []const Value) Error!Value {
     // yields the string "null".
     if (args.len == 2 and args[1] == .null) return null_v;
     if (args[0] == .null) return Value{ .string = try alloc.dupe(u8, "null") };
-    return Value{ .string = try args[0].toJson(alloc) };
+    return Value{ .string = try args[0].toJson(alloc, .string) };
 }
 
 pub fn jsonType(alloc: std.mem.Allocator, args: []const Value) Error!Value {
@@ -693,7 +693,8 @@ pub fn laxString(alloc: std.mem.Allocator, args: []const Value) Error!Value {
             // though the document keeps the sign (TO_JSON_STRING(JSON '-0.0')
             // is "-0.0" and LAX_FLOAT64 of it is -0.0).
             const c = if (f == 0) 0.0 else f;
-            break :blk Value{ .string = try alloc.dupe(u8, value_mod.formatFloatGo(&buf, c)) };
+            const text = value_mod.formatFloatShortest(&buf, c);
+            break :blk Value{ .string = try alloc.dupe(u8, text) };
         },
         .string => |s| Value{ .string = try alloc.dupe(u8, s) },
         .other => null_v,
@@ -711,7 +712,7 @@ pub fn jsonArray(alloc: std.mem.Allocator, args: []const Value) Error!Value {
     try out.append(alloc, '[');
     for (args, 0..) |a, i| {
         if (i > 0) try out.append(alloc, ',');
-        try out.appendSlice(alloc, try a.toJson(alloc));
+        try out.appendSlice(alloc, try a.toJson(alloc, .json));
     }
     try out.append(alloc, ']');
     return canonicalJson(alloc, out.items);
@@ -763,7 +764,7 @@ fn appendMember(
         if (std.mem.eql(u8, seen, k)) return;
     }
     try keys.append(alloc, k);
-    try vals.append(alloc, try val.toJson(alloc));
+    try vals.append(alloc, try val.toJson(alloc, .json));
 }
 
 fn buildObject(
@@ -822,7 +823,7 @@ fn mutatorPath(alloc: std.mem.Allocator, s: []const u8) Error!Path {
 /// A SQL value as a JSON tree. SQL NULL becomes the JSON null, which is why
 /// JSON_SET(JSON '{"a":1}', '$.a', NULL) is `{"a":null}` and not a NULL result.
 fn jsonValueOf(alloc: std.mem.Allocator, v: Value) Error!std.json.Value {
-    const text = try v.toJson(alloc);
+    const text = try v.toJson(alloc, .json);
     return parseJson(alloc, text) orelse
         bind.fail("failed to convert to JSON value: {s}", .{text}, error.FailedConversion);
 }
@@ -1687,7 +1688,7 @@ fn keysOf(alloc: std.mem.Allocator, doc: []const u8, depth: i64, mode: []const u
         Value{ .int = depth },
         strArg(mode),
     });
-    return (try v.toJson(alloc));
+    return (try v.toJson(alloc, .json));
 }
 
 test "jsonKeys: dotted paths, sorted and deduplicated" {
@@ -1794,7 +1795,7 @@ test "jsonFlatten stops at the first non-array" {
     const a = arena.allocator();
     const T = struct {
         fn flat(al: std.mem.Allocator, doc: []const u8) ![]const u8 {
-            return (try jsonFlatten(al, &.{jsonArg(doc)})).toJson(al);
+            return (try jsonFlatten(al, &.{jsonArg(doc)})).toJson(al, .json);
         }
     };
     try testing.expectEqualStrings("[1,2,3]", try T.flat(a, "[[1],[2,3]]"));

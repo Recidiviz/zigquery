@@ -3935,7 +3935,7 @@ fn castParamValue(
         .TYPE_STRING, .TYPE_ENUM => return .{ .string = try v.toString(alloc) },
         .TYPE_BYTES => return .{ .bytes = try v.toBytes(alloc) },
         // CAST to JSON.
-        .TYPE_JSON => return .{ .json = try v.toJson(alloc) },
+        .TYPE_JSON => return .{ .json = try v.toJson(alloc, .json) },
         // The civil date of the instant. Every kind routes through the instant rather than
         // through a per-kind parser, so a malformed date reports one message.
         .TYPE_DATE => {

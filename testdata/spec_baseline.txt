@@ -5327,6 +5327,11 @@ zigquery/types/boolean	null
 zigquery/types/bytes	bytes_formatting
 zigquery/types/date	date type
 zigquery/types/date	minimum / maximum date value
+zigquery/types/float	CAST to STRING
+zigquery/types/float	CONCAT
+zigquery/types/float	FORMAT %t and %T
+zigquery/types/float	TO_JSON_STRING of FLOAT64, in a struct and in an array
+zigquery/types/float	infinities as text
 zigquery/types/integer	CAST AS INT
 zigquery/types/integer	CAST AS INTEGER
 zigquery/types/integer	CAST AS BIGINT

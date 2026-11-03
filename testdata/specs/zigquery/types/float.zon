@@ -1,0 +1,103 @@
+.{
+    .spec = "zigquery/types/float",
+    .dialect = .zigquery,
+    .typed = true,
+    // FLOAT64 rendered as text. Values come through UNNEST so no literal is folded before the
+    // conversion runs. Every expectation measured (recidiviz-bigquery-sandbox, 2026-10-30).
+    .cases = .{
+        // 15 significant digits when they read back as the same double, otherwise 17, in C's %g
+        // layout: exponent form below 1e-4 and from 1e15 (1e17 on the 17-digit path).
+        .{
+            .desc = "CAST to STRING",
+            .sql =
+            \\SELECT o, CAST(x AS STRING) AS s FROM UNNEST([1e14, 1e15, 123456789012345.6,
+            \\  1234567890123456.7, 12345678901234567.0, 198207565.11698252, 0.30000000000000004,
+            \\  1e-4, 1e-5, 5.551115123125783e-17, 1.5e300, 4.9e-324, 100.0, -0.0]) AS x WITH OFFSET o
+            \\ORDER BY o
+            ,
+            .rows = .{
+                .{ 0, "100000000000000" },
+                .{ 1, "1e+15" },
+                .{ 2, "123456789012345.59" },
+                .{ 3, "1234567890123456.8" },
+                .{ 4, "12345678901234568" },
+                .{ 5, "198207565.11698252" },
+                .{ 6, "0.30000000000000004" },
+                .{ 7, "0.0001" },
+                .{ 8, "1e-05" },
+                .{ 9, "5.5511151231257827e-17" },
+                .{ 10, "1.5e+300" },
+                .{ 11, "4.94065645841247e-324" },
+                .{ 12, "100" },
+                .{ 13, "-0" },
+            },
+        },
+        .{
+            .desc = "CONCAT",
+            .sql =
+            \\SELECT o, CONCAT('v=', CAST(x AS STRING)) AS s
+            \\FROM UNNEST([1e14, 198207565.11698252, 1e-5]) AS x WITH OFFSET o ORDER BY o
+            ,
+            .rows = .{
+                .{ 0, "v=100000000000000" },
+                .{ 1, "v=198207565.11698252" },
+                .{ 2, "v=1e-05" },
+            },
+        },
+        // %t and %T add .0 to digits that would otherwise read as an integer.
+        .{
+            .desc = "FORMAT %t and %T",
+            .sql =
+            \\SELECT o, FORMAT('%t', x) AS t, FORMAT('%T', x) AS lit
+            \\FROM UNNEST([100.0, 1e14, 1e15, -0.0, 198207565.11698252]) AS x WITH OFFSET o ORDER BY o
+            ,
+            .rows = .{
+                .{ 0, "100.0", "100.0" },
+                .{ 1, "100000000000000.0", "100000000000000.0" },
+                .{ 2, "1e+15", "1e+15" },
+                .{ 3, "-0.0", "-0.0" },
+                .{ 4, "198207565.11698252", "198207565.11698252" },
+            },
+        },
+        // TO_JSON_STRING of a SQL value uses the CAST digits, without FORMAT's .0.
+        .{
+            .desc = "TO_JSON_STRING of FLOAT64, in a struct and in an array",
+            .sql =
+            \\SELECT o, TO_JSON_STRING(x) AS v, TO_JSON_STRING(STRUCT(x AS v)) AS st,
+            \\  TO_JSON_STRING([x]) AS arr
+            \\FROM UNNEST([1e14, 100.0, 5.551115123125783e-17, 4.9e-324]) AS x WITH OFFSET o ORDER BY o
+            ,
+            .rows = .{
+                .{ 0, "100000000000000", "{\"v\":100000000000000}", "[100000000000000]" },
+                .{ 1, "100", "{\"v\":100}", "[100]" },
+                .{ 2, "5.5511151231257827e-17", "{\"v\":5.5511151231257827e-17}", "[5.5511151231257827e-17]" },
+                .{ 3, "4.94065645841247e-324", "{\"v\":4.94065645841247e-324}", "[4.94065645841247e-324]" },
+            },
+        },
+        // CAST and %t write inf and -inf; %T writes a cast from that string; TO_JSON_STRING writes
+        // the JSON strings "Infinity" and "-Infinity".
+        .{
+            .desc = "infinities as text",
+            .sql =
+            \\SELECT o, CAST(x AS STRING) AS s, FORMAT('%t', x) AS t, FORMAT('%T', x) AS lit,
+            \\  TO_JSON_STRING(x) AS j
+            \\FROM UNNEST([CAST('inf' AS FLOAT64), CAST('-inf' AS FLOAT64)]) AS x WITH OFFSET o ORDER BY o
+            ,
+            .rows = .{
+                .{ 0, "inf", "inf", "CAST(\"inf\" AS FLOAT64)", "\"Infinity\"" },
+                .{ 1, "-inf", "-inf", "CAST(\"-inf\" AS FLOAT64)", "\"-Infinity\"" },
+            },
+        },
+        .{
+            .desc = "NaN as text",
+            .sql =
+            \\SELECT CAST(x AS STRING) AS s, FORMAT('%t', x) AS t, FORMAT('%T', x) AS lit,
+            \\  TO_JSON_STRING(x) AS j
+            \\FROM UNNEST([CAST('nan' AS FLOAT64)]) AS x
+            ,
+            .rows = .{
+                .{ "nan", "nan", "CAST(\"nan\" AS FLOAT64)", "\"NaN\"" },
+            },
+        },
+    },
+}

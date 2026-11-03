@@ -152,7 +152,7 @@ pub fn LiteralFromValue(alloc: std.mem.Allocator, v: Value) ValueError![]u8 {
             if (std.math.isNan(f)) return alloc.dupe(u8, "zigquery_nan_literal()");
             if (std.math.isInf(f)) return alloc.dupe(u8, if (f > 0) "1e400" else "-1e400");
             var buf: [32]u8 = undefined;
-            const s = value_mod.formatFloatGo(&buf, f);
+            const s = value_mod.formatFloatShortest(&buf, f);
             // Go: append ".0" to keep float context when the 'g' form has
             // neither '.' nor 'e' (e.g. "42" -> "42.0").
             if (std.mem.indexOfScalar(u8, s, '.') == null and

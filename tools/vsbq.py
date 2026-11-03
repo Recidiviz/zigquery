@@ -292,8 +292,14 @@ def align(ours, theirs):
                 names_differ = True
             tval = rt.get(kt) if kt is not None else None
             name = ko if by_name else f"c{i}"
-            co[name] = canon_engine_cell(ro[ko], isinstance(tval, (list, dict)))
-            ct[name] = canon(tval)
+            if isinstance(tval, str):
+                # A STRING cell is compared as text: canon() would read "1e+14" and
+                # "100000000000000" as the same number.
+                co[name] = ro[ko].strip()
+                ct[name] = tval.strip()
+            else:
+                co[name] = canon_engine_cell(ro[ko], isinstance(tval, (list, dict)))
+                ct[name] = canon(tval)
         out_o.append(co)
         out_t.append(ct)
     return out_o, out_t, names_differ

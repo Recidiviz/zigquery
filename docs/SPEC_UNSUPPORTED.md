@@ -286,13 +286,12 @@ go-zetasqlite's `query_test.go` and had been green since import — the same fai
 this section exists for, in the engine's own regression suite rather than in the imported
 trees.
 
-**9. `formatFloatGo` still spells non-finite values Go's way.** `value.zig:2328` returns
-`NaN` / `+Inf` / `-Inf` where `CAST(CAST('inf' AS FLOAT64) AS STRING)` is `inf` in
-BigQuery. It has eight call sites — CAST, `%t`, the JSON family and the row encoder — and
-a unit test pinning the current strings, so it is left for a change of its own. Also
-measured: `FORMAT('%T', <infinity>)` is `CAST("inf" AS FLOAT64)` in BigQuery, since `%T`
-wraps values that have no literal representation; this engine gives the bare word. Both
-are unreachable today anyway, because of the two limitations under §7.
+**9. A JSON value spells a non-finite FLOAT64 as `NaN` / `+Inf` / `-Inf`.** TO_JSON,
+JSON_ARRAY, JSON_OBJECT and a cast to JSON write `formatFloatShortest`'s spelling
+(`value.zig`) into the JSON text, which is not valid JSON, so `JSON_ARRAY(CAST('inf' AS
+FLOAT64))` fails the query. BigQuery writes the JSON strings `"Infinity"`, `"-Infinity"`
+and `"NaN"`. CAST, CONCAT, FORMAT `%t`/`%T` and TO_JSON_STRING spell non-finite values as
+BigQuery does (`testdata/specs/zigquery/types/float.zon`).
 
 Still open, and recorded rather than fixed: **BigQuery resolves any tzdata zone and this
 engine carries four.** `DATETIME(TIMESTAMP '2024-03-14 12:00:00+00', 'Europe/Paris')` is

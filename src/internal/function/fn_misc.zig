@@ -195,7 +195,7 @@ fn castValue(alloc: std.mem.Allocator, t: std.json.Value, v: Value) Error!Value 
             return Value{ .string = try v.toString(alloc) };
         },
         .TYPE_BYTES => return Value{ .bytes = try v.toBytes(alloc) },
-        .TYPE_JSON => return Value{ .json = try v.toJson(alloc) },
+        .TYPE_JSON => return Value{ .json = try v.toJson(alloc, .json) },
         .TYPE_DATE => switch (v) {
             .date => return v,
             .string => |s| return Value{ .date = try value_mod.parseDateDays(s) },

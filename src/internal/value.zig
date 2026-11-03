@@ -1122,7 +1122,7 @@ pub const Value = union(enum) {
             .int => |i| return std.fmt.allocPrint(alloc, "{d}", .{i}),
             .float => |f| {
                 var buf: [32]u8 = undefined;
-                return alloc.dupe(u8, formatFloatGo(&buf, f));
+                return alloc.dupe(u8, formatFloatSql(&buf, f));
             },
             .bool => |b| return alloc.dupe(u8, if (b) "true" else "false"),
             .string => |s| return alloc.dupe(u8, s),
@@ -1160,7 +1160,7 @@ pub const Value = union(enum) {
             // element via ToJSON and are byte-identical to ToJSON itself
             // (ArrayValue.ToJSON/StructValue.ToJSON just call ToString), so
             // delegate to toJson to get the same "[..]" / "{..}" rendering.
-            .array, .struct_ => return self.toJson(alloc),
+            .array, .struct_ => return self.toJson(alloc, .json),
             .safe => |p| return p.toString(alloc) catch alloc.dupe(u8, ""),
         }
     }
@@ -1214,13 +1214,21 @@ pub const Value = union(enum) {
     /// TO_JSON_STRING and by struct/array element rendering. Scalars stringify;
     /// strings/bytes/date/time kinds are strconv.Quote'd; struct/array recurse
     /// with preserved key order; json passes through verbatim.
-    pub fn toJson(self: Value, alloc: std.mem.Allocator) ValueError![]u8 {
+    pub fn toJson(self: Value, alloc: std.mem.Allocator, output: JsonOutput) ValueError![]u8 {
         switch (self) {
             .null => return alloc.dupe(u8, "null"),
             .int => |i| return std.fmt.allocPrint(alloc, "{d}", .{i}),
             .float => |f| {
                 var buf: [32]u8 = undefined;
-                return alloc.dupe(u8, formatFloatGo(&buf, f));
+                return switch (output) {
+                    .json => alloc.dupe(u8, formatFloatShortest(&buf, f)),
+                    .string => if (std.math.isNan(f))
+                        alloc.dupe(u8, "\"NaN\"")
+                    else if (std.math.isInf(f))
+                        alloc.dupe(u8, if (f > 0) "\"Infinity\"" else "\"-Infinity\"")
+                    else
+                        alloc.dupe(u8, formatFloatSql(&buf, f)),
+                };
             },
             .bool => |b| return alloc.dupe(u8, if (b) "true" else "false"),
             .string => |s| return quoteJsonString(alloc, s),
@@ -1270,7 +1278,7 @@ pub const Value = union(enum) {
                 try out.append(alloc, '[');
                 for (arr.values, 0..) |elem, i| {
                     if (i > 0) try out.append(alloc, ',');
-                    const ej = try elem.toJson(alloc);
+                    const ej = try elem.toJson(alloc, output);
                     try out.appendSlice(alloc, ej);
                 }
                 try out.append(alloc, ']');
@@ -1286,13 +1294,13 @@ pub const Value = union(enum) {
                     const kq = try quoteJsonString(alloc, key);
                     try out.appendSlice(alloc, kq);
                     try out.append(alloc, ':');
-                    const ej = try elem.toJson(alloc);
+                    const ej = try elem.toJson(alloc, output);
                     try out.appendSlice(alloc, ej);
                 }
                 try out.append(alloc, '}');
                 return out.items;
             },
-            .safe => |p| return p.toJson(alloc),
+            .safe => |p| return p.toJson(alloc, output),
         }
     }
     /// Go Value.ToRat per kind. Quirks kept: String/Bytes ignore the
@@ -1378,8 +1386,8 @@ pub const Value = union(enum) {
             .null => return alloc.dupe(u8, "NULL"),
             .int => |i| return std.fmt.allocPrint(alloc, "{d}", .{i}),
             .float => |f| {
-                var buf: [40]u8 = undefined;
-                return alloc.dupe(u8, formatFloatGo(&buf, f));
+                var buf: [48]u8 = undefined;
+                return alloc.dupe(u8, formatFloatFormat(&buf, f, verb));
             },
             .bool => |b| return alloc.dupe(u8, if (b) "true" else "false"),
             .string => |s| {
@@ -1513,7 +1521,7 @@ fn coerceToStringForCmp(v: Value, buf: []u8) ValueError![]const u8 {
         .bytes => |b| return b,
         .json => |s| return s,
         .int => |i| return std.fmt.bufPrint(buf, "{d}", .{i}) catch unreachable,
-        .float => |f| return formatFloatGo(buf, f),
+        .float => |f| return formatFloatShortest(buf, f),
         .bool => |b| return if (b) "true" else "false",
         .date => |days| return formatDateDays(buf, days),
         // ToString forms (buf is >= 32 bytes; interval can exceed it, so it
@@ -2439,14 +2447,48 @@ pub fn parseIntervalValue(s: []const u8) ValueError!Interval {
 }
 
 // ----------------------------------------------------------------------
-// Go-compatible float formatting: strconv.FormatFloat(f, 'g', -1, 64)
+// FLOAT64 as text
 // ----------------------------------------------------------------------
 
-/// Renders `f` exactly as Go's strconv.FormatFloat(f, 'g', -1, 64) /
-/// fmt.Sprint(float64) does: shortest round-trip digits, %e form when the
-/// decimal exponent is < -4 or >= 6, "e+06"-style exponents (sign, >= 2
-/// digits). `buf` must be at least 32 bytes.
-pub fn formatFloatGo(buf: []u8, f: f64) []const u8 {
+extern "c" fn snprintf(buf: [*]u8, size: usize, format: [*:0]const u8, ...) c_int;
+extern "c" fn strtod(s: [*:0]const u8, end: ?*[*:0]u8) f64;
+
+/// FLOAT64 as CAST(... AS STRING) outputs: 15 significant digits when they read back as the same
+/// double, otherwise 17, in C's `%g` layout. conversion_functions.md#cast_as_string. `buf` must be
+/// at least 32 bytes.
+pub fn formatFloatSql(buf: []u8, f: f64) []const u8 {
+    if (std.math.isNan(f)) return "nan";
+    if (std.math.isInf(f)) return if (f > 0) "inf" else "-inf";
+    std.debug.assert(buf.len >= 32);
+    const short = snprintf(buf.ptr, buf.len, "%.15g", f);
+    if (strtod(@ptrCast(buf.ptr), null) == f) return buf[0..@intCast(short)];
+    const full = snprintf(buf.ptr, buf.len, "%.17g", f);
+    return buf[0..@intCast(full)];
+}
+
+/// FLOAT64 as FORMAT's `%t` and `%T` spell it: the CAST(... AS STRING) digits, `.0` after an
+/// integral spelling, and `%T`'s non-finite values as casts. string_functions.md#t_and_t_behavior.
+/// `buf` must be at least 48 bytes.
+pub fn formatFloatFormat(buf: []u8, f: f64, verb: u8) []const u8 {
+    var digits_buf: [32]u8 = undefined;
+    const digits = formatFloatSql(&digits_buf, f);
+    if (!std.math.isFinite(f)) {
+        if (verb != 'T') return std.fmt.bufPrint(buf, "{s}", .{digits}) catch unreachable;
+        return std.fmt.bufPrint(buf, "CAST(\"{s}\" AS FLOAT64)", .{digits}) catch unreachable;
+    }
+    const integral = std.mem.indexOfNone(u8, digits, "-0123456789") == null;
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ digits, if (integral) ".0" else "" }) catch unreachable;
+}
+
+/// What `Value.toJson` produces, which decides how it spells FLOAT64. `.string` is TO_JSON_STRING's
+/// STRING result: the CAST(... AS STRING) digits, and non-finite values as JSON strings
+/// (json_functions.md#to_json_string). `.json` is a JSON value, as TO_JSON, JSON_ARRAY, JSON_OBJECT
+/// and a cast to JSON produce.
+pub const JsonOutput = enum { string, json };
+
+/// FLOAT64 in the shortest digits that read back as the same double, with an exponent below 1e-4
+/// and from 1e6. `buf` must be at least 32 bytes.
+pub fn formatFloatShortest(buf: []u8, f: f64) []const u8 {
     if (std.math.isNan(f)) return "NaN";
     if (std.math.isInf(f)) return if (f > 0) "+Inf" else "-Inf";
 
@@ -2770,7 +2812,63 @@ test "date string parse/format round trip" {
     try std.testing.expectError(error.InvalidDate, parseDateDays("garbage"));
 }
 
-test "formatFloatGo matches Go strconv 'g' output" {
+test "formatFloatSql spells FLOAT64 as CAST(... AS STRING) does" {
+    const cases = [_]struct { f: f64, s: []const u8 }{
+        .{ .f = 1e14, .s = "100000000000000" },
+        .{ .f = 1e15, .s = "1e+15" },
+        .{ .f = 123456789012345.6, .s = "123456789012345.59" },
+        .{ .f = 1234567890123456.7, .s = "1234567890123456.8" },
+        .{ .f = 12345678901234567.0, .s = "12345678901234568" },
+        .{ .f = 198207565.11698252, .s = "198207565.11698252" },
+        .{ .f = 0.30000000000000004, .s = "0.30000000000000004" },
+        .{ .f = 1e-4, .s = "0.0001" },
+        .{ .f = 1e-5, .s = "1e-05" },
+        .{ .f = 5.551115123125783e-17, .s = "5.5511151231257827e-17" },
+        .{ .f = 1.5e300, .s = "1.5e+300" },
+        .{ .f = 4.9e-324, .s = "4.94065645841247e-324" },
+        .{ .f = 100.0, .s = "100" },
+        .{ .f = -0.0, .s = "-0" },
+        .{ .f = std.math.inf(f64), .s = "inf" },
+        .{ .f = -std.math.inf(f64), .s = "-inf" },
+        .{ .f = std.math.nan(f64), .s = "nan" },
+    };
+    var buf: [32]u8 = undefined;
+    for (cases) |c| try std.testing.expectEqualStrings(c.s, formatFloatSql(&buf, c.f));
+}
+
+test "formatFloatFormat spells FLOAT64 for FORMAT %t and %T" {
+    const cases = [_]struct { f: f64, t: []const u8, big_t: []const u8 }{
+        .{ .f = 100.0, .t = "100.0", .big_t = "100.0" },
+        .{ .f = 1e14, .t = "100000000000000.0", .big_t = "100000000000000.0" },
+        .{ .f = 1e15, .t = "1e+15", .big_t = "1e+15" },
+        .{ .f = -0.0, .t = "-0.0", .big_t = "-0.0" },
+        .{ .f = 0.1, .t = "0.1", .big_t = "0.1" },
+        .{ .f = std.math.inf(f64), .t = "inf", .big_t = "CAST(\"inf\" AS FLOAT64)" },
+        .{ .f = -std.math.inf(f64), .t = "-inf", .big_t = "CAST(\"-inf\" AS FLOAT64)" },
+    };
+    var buf: [48]u8 = undefined;
+    for (cases) |c| {
+        try std.testing.expectEqualStrings(c.t, formatFloatFormat(&buf, c.f, 't'));
+        try std.testing.expectEqualStrings(c.big_t, formatFloatFormat(&buf, c.f, 'T'));
+    }
+}
+
+test "toJson spells FLOAT64 as TO_JSON_STRING does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const arr = try arrayValue(alloc, &.{
+        Value{ .float = 1e14 },
+        Value{ .float = std.math.inf(f64) },
+        Value{ .float = -std.math.inf(f64) },
+    });
+    try std.testing.expectEqualStrings(
+        "[100000000000000,\"Infinity\",\"-Infinity\"]",
+        try arr.toJson(alloc, .string),
+    );
+}
+
+test "formatFloatShortest spells the shortest round-trip digits" {
     var buf: [32]u8 = undefined;
     const cases = [_]struct { f: f64, s: []const u8 }{
         .{ .f = 42.0, .s = "42" },
@@ -2792,11 +2890,11 @@ test "formatFloatGo matches Go strconv 'g' output" {
         .{ .f = -0.0, .s = "-0" },
     };
     for (cases) |c| {
-        try std.testing.expectEqualStrings(c.s, formatFloatGo(&buf, c.f));
+        try std.testing.expectEqualStrings(c.s, formatFloatShortest(&buf, c.f));
     }
-    try std.testing.expectEqualStrings("NaN", formatFloatGo(&buf, std.math.nan(f64)));
-    try std.testing.expectEqualStrings("+Inf", formatFloatGo(&buf, std.math.inf(f64)));
-    try std.testing.expectEqualStrings("-Inf", formatFloatGo(&buf, -std.math.inf(f64)));
+    try std.testing.expectEqualStrings("NaN", formatFloatShortest(&buf, std.math.nan(f64)));
+    try std.testing.expectEqualStrings("+Inf", formatFloatShortest(&buf, std.math.inf(f64)));
+    try std.testing.expectEqualStrings("-Inf", formatFloatShortest(&buf, -std.math.inf(f64)));
 }
 
 test "int arithmetic and comparisons coerce like Go" {
@@ -3475,17 +3573,17 @@ test "BYTES is base64 in JSON, at every nesting depth" {
     // TO_JSON_STRING(CODE_POINTS_TO_BYTES([72, 101])) read "He", and produced
     // invalid JSON outright for anything not already UTF-8.
     const he = Value{ .bytes = "He" };
-    try std.testing.expectEqualStrings("\"SGU=\"", try he.toJson(alloc));
+    try std.testing.expectEqualStrings("\"SGU=\"", try he.toJson(alloc, .json));
 
     // Arrays and structs recurse through the same arm.
     const arr = try arrayValue(alloc, &.{ he, Value{ .bytes = "Hi" } });
-    try std.testing.expectEqualStrings("[\"SGU=\",\"SGk=\"]", try arr.toJson(alloc));
+    try std.testing.expectEqualStrings("[\"SGU=\",\"SGk=\"]", try arr.toJson(alloc, .json));
     const st = try structValue(alloc, &.{"x"}, &.{he});
-    try std.testing.expectEqualStrings("{\"x\":\"SGU=\"}", try st.toJson(alloc));
+    try std.testing.expectEqualStrings("{\"x\":\"SGU=\"}", try st.toJson(alloc, .json));
 
     // Bytes that are not valid UTF-8 survive, where quoting them did not.
     const raw = Value{ .bytes = &[_]u8{ 0xff, 0x00, 0x80 } };
-    try std.testing.expectEqualStrings("\"/wCA\"", try raw.toJson(alloc));
+    try std.testing.expectEqualStrings("\"/wCA\"", try raw.toJson(alloc, .json));
 }
 
 test "range renders each element kind the way the reference docs print it" {
