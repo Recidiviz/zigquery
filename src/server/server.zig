@@ -1563,7 +1563,7 @@ pub const Server = struct {
                     arena,
                     "http://{s}/upload/bigquery/v2/projects/{s}/jobs" ++
                         "?uploadType=resumable&upload_id={s}",
-                    .{ req.headers.host orelse s.endpoint, project_id, id },
+                    .{ req.endpoint orelse s.endpoint, project_id, id },
                 ),
             }}),
         };
@@ -2808,7 +2808,7 @@ test "a resumable session URI names the Host the client sent, else the bind addr
         .method = .POST,
         .path = "/upload/bigquery/v2/projects/test/jobs",
         .query = "uploadType=resumable",
-        .headers = .{ .host = "bigquery-emulator:9050" },
+        .endpoint = "bigquery-emulator:9050",
         .body = metadata,
         .arena = arena,
     });

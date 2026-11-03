@@ -45,8 +45,6 @@ pub const Headers = struct {
     /// What a resumable upload says its bytes will be.
     x_upload_content_type: ?[]const u8 = null,
     x_upload_content_length: ?[]const u8 = null,
-    /// The authority the client addressed, which a resumable session URI has to name.
-    host: ?[]const u8 = null,
 };
 
 pub const Request = struct {
@@ -58,6 +56,9 @@ pub const Request = struct {
     /// Decompressed request body. Empty when there is none.
     body: []const u8,
     headers: Headers = .{},
+    /// host:port the client addressed, from a `Host` header that passed endpointFromHost.
+    /// Null when there was none, which leaves the handler to use the address it bound.
+    endpoint: ?[]const u8 = null,
     /// Per-request arena. Everything a handler allocates comes from here and
     /// dies when the request completes.
     arena: std.mem.Allocator,
@@ -136,6 +137,10 @@ pub const Server = struct {
     endpoint: Endpoint,
     listeners: [1]dusty.Listener,
     inner: dusty.Server(Endpoint),
+    /// dusty's global middlewares, run in this order around every request.
+    middlewares: [2]dusty.Middleware(Endpoint) = undefined,
+    request_scope: RequestScope = .{},
+    engine_lock: EngineLock,
     /// The task running `inner.run`, from `listen` until `serve` or `deinit`
     /// collects it.
     running: ?std.Io.Future(anyerror!void) = null,
@@ -159,7 +164,8 @@ pub const Server = struct {
         s.* = .{
             .gpa = gpa,
             .io = io,
-            .endpoint = .{ .handler = handler, .io = io },
+            .endpoint = .{ .handler = handler },
+            .engine_lock = .{ .mutex = handler.mutex, .io = handler.io },
             .listeners = .{.{
                 .address = .{ .ip = try std.Io.net.IpAddress.parse(opts.address, opts.port) },
             }},
@@ -188,6 +194,8 @@ pub const Server = struct {
             },
         }, &s.endpoint);
         errdefer s.inner.deinit();
+        s.middlewares = .{ .init(&s.request_scope), .init(&s.engine_lock) };
+        s.inner.router.middlewares = &s.middlewares;
 
         s.running = try io.concurrent(runInner, .{s});
         s.inner.ready.waitUncancelable(io);
@@ -236,9 +244,19 @@ pub const Server = struct {
 /// each request reaches `notFound`, which is the dispatch entry point.
 const Endpoint = struct {
     handler: Handler,
-    io: std.Io,
 
-    pub fn notFound(e: *Endpoint, req: *dusty.Request, res: *dusty.Response) !void {
+    /// What the middlewares settle once per request, for the handler and the error hook.
+    pub const RequestContext = struct {
+        /// See Request.endpoint.
+        endpoint: ?[]const u8 = null,
+    };
+
+    pub fn notFound(
+        e: *Endpoint,
+        req: *dusty.Request,
+        res: *dusty.Response,
+        ctx: *const RequestContext,
+    ) !void {
         const method = methodFrom(req.method) orelse {
             res.status = .method_not_allowed;
             return;
@@ -252,10 +270,11 @@ const Endpoint = struct {
             .query = if (q) |i| req.url[i + 1 ..] else "",
             .body = try req.body() orelse "",
             .headers = headersFrom(req),
+            .endpoint = ctx.endpoint,
             .arena = req.arena,
         };
 
-        const out = try e.dispatch(&r);
+        const out = try e.handler.func(e.handler.ctx, &r);
 
         res.status = std.enums.fromInt(dusty.Status, @intFromEnum(out.status)) orelse
             return error.UnsupportedStatus;
@@ -264,7 +283,12 @@ const Endpoint = struct {
         res.body = out.body;
     }
 
-    pub fn uncaughtError(req: *dusty.Request, res: *dusty.Response, err: anyerror) void {
+    pub fn uncaughtError(
+        req: *dusty.Request,
+        res: *dusty.Response,
+        ctx: *const RequestContext,
+        err: anyerror,
+    ) void {
         res.header("Content-Type", "application/json; charset=UTF-8") catch |header_err|
             std.log.warn("error response sent without a content type: {t}", .{header_err});
         if (req.clientErrorStatus()) |status| {
@@ -278,40 +302,109 @@ const Endpoint = struct {
         }
         // Mirrors Go's recoveryMiddleware: report, answer, keep the
         // connection.
-        std.log.err("request failed: {t} {s}: {t}", .{ req.method, req.url, err });
+        std.log.err("request failed: {t} {s} (host {s}): {t}", .{
+            req.method,
+            req.url,
+            ctx.endpoint orelse "unset",
+            err,
+        });
         res.status = .internal_server_error;
         res.body = internal_error_body;
     }
+};
 
-    /// Runs the handler under its mutex, recording how long the request
-    /// waited for it and how long it held it.
-    fn dispatch(e: *Endpoint, r: *const Request) !Response {
+/// Settles RequestContext.endpoint from the `Host` header.
+const RequestScope = struct {
+    pub fn execute(
+        _: *const RequestScope,
+        req: *dusty.Request,
+        _: *dusty.Response,
+        executor: anytype,
+    ) !void {
+        executor.ctx.endpoint = if (req.headers.get("host")) |host| endpointFromHost(host) else null;
+        return executor.next();
+    }
+};
+
+/// Holds the handler's mutex across the rest of the request, recording how long the request
+/// waited for it and how long it held it.
+const EngineLock = struct {
+    mutex: *std.Io.Mutex,
+    io: std.Io,
+
+    pub fn execute(
+        l: *const EngineLock,
+        _: *dusty.Request,
+        _: *dusty.Response,
+        executor: anytype,
+    ) !void {
         const waiting = stat_waiters_now.fetchAdd(1, .monotonic) + 1;
         if (waiting > stat_waiters_max.load(.monotonic)) {
             stat_waiters_max.store(waiting, .monotonic);
         }
-        const t_arrive = std.Io.Clock.awake.now(e.io);
+        const t_arrive = std.Io.Clock.awake.now(l.io);
 
-        e.handler.mutex.lockUncancelable(e.handler.io);
-        const t_locked = std.Io.Clock.awake.now(e.io);
+        l.mutex.lockUncancelable(l.io);
+        defer l.mutex.unlock(l.io);
+        const t_locked = std.Io.Clock.awake.now(l.io);
         _ = stat_waiters_now.fetchSub(1, .monotonic);
-        defer e.handler.mutex.unlock(e.handler.io);
-
-        const out = try e.handler.func(e.handler.ctx, r);
-        const t_done = std.Io.Clock.awake.now(e.io);
-
-        _ = stat_requests.fetchAdd(1, .monotonic);
-        _ = stat_wait_ns.fetchAdd(
-            @intCast(t_arrive.durationTo(t_locked).nanoseconds),
-            .monotonic,
-        );
-        _ = stat_handle_ns.fetchAdd(
-            @intCast(t_locked.durationTo(t_done).nanoseconds),
-            .monotonic,
-        );
-        return out;
+        // Runs before the unlock above, on success and on error alike.
+        defer {
+            const t_done = std.Io.Clock.awake.now(l.io);
+            _ = stat_requests.fetchAdd(1, .monotonic);
+            _ = stat_wait_ns.fetchAdd(
+                @intCast(t_arrive.durationTo(t_locked).nanoseconds),
+                .monotonic,
+            );
+            _ = stat_handle_ns.fetchAdd(
+                @intCast(t_locked.durationTo(t_done).nanoseconds),
+                .monotonic,
+            );
+        }
+        return executor.next();
     }
 };
+
+/// The `Host` header as an endpoint for URLs, or null when it is not a plain
+/// `name[:port]` or `[ipv6][:port]` this server can echo back.
+pub fn endpointFromHost(host: []const u8) ?[]const u8 {
+    if (host.len == 0 or host.len > 255) return null;
+    const authority_end = if (host[0] == '[')
+        (std.mem.indexOfScalar(u8, host, ']') orelse return null) + 1
+    else
+        std.mem.indexOfScalar(u8, host, ':') orelse host.len;
+    const authority = host[0..authority_end];
+    const rest = host[authority_end..];
+    if (!validHostName(authority) and !validIpv6Literal(authority)) return null;
+    if (rest.len > 0 and (rest[0] != ':' or !validPort(rest[1..]))) return null;
+    return host;
+}
+
+/// A DNS name or IPv4 address: letters, digits, dots and hyphens.
+fn validHostName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '.' and ch != '-') return false;
+    }
+    return true;
+}
+
+/// `[` hex digits, colons and dots `]`. A zone index (`%en0`) is refused.
+fn validIpv6Literal(literal: []const u8) bool {
+    if (literal.len < 3 or literal[0] != '[' or literal[literal.len - 1] != ']') return false;
+    for (literal[1 .. literal.len - 1]) |ch| {
+        if (!std.ascii.isHex(ch) and ch != ':' and ch != '.') return false;
+    }
+    return true;
+}
+
+/// Decimal digits naming a port from 0 to 65535.
+fn validPort(digits: []const u8) bool {
+    if (digits.len == 0) return false;
+    for (digits) |ch| if (!std.ascii.isDigit(ch)) return false;
+    _ = std.fmt.parseInt(u16, digits, 10) catch return false;
+    return true;
+}
 
 /// The 4xx bodies for what the client got wrong before a handler ran. Spelled
 /// out for the same reason as `internal_error_body`.
@@ -350,7 +443,6 @@ fn headersFrom(req: *const dusty.Request) Headers {
         .content_range = req.headers.get("content-range"),
         .x_upload_content_type = req.headers.get("x-upload-content-type"),
         .x_upload_content_length = req.headers.get("x-upload-content-length"),
-        .host = req.headers.get("host"),
     };
 }
 
@@ -381,4 +473,37 @@ test "empty query string yields no parameters" {
         .arena = std.testing.allocator,
     };
     try std.testing.expectEqual(@as(?[]const u8, null), r.queryParam("maxResults"));
+}
+
+test "endpointFromHost admits host names, IPv4 and bracketed IPv6, with or without a port" {
+    const ok = [_][]const u8{
+        "bigquery-emulator:9050",
+        "localhost",
+        "127.0.0.1:60050",
+        "[::1]:9050",
+        "[::1]",
+        "bq.example.internal",
+    };
+    for (ok) |host| try std.testing.expectEqualStrings(host, endpointFromHost(host).?);
+}
+
+test "endpointFromHost rejects what cannot be echoed into a URL" {
+    const long: [256]u8 = @splat('a');
+    const bad = [_][]const u8{
+        "",
+        &long,
+        "evil/path",
+        "a b",
+        "host:",
+        ":9050",
+        "host:99999",
+        "host:9a",
+        "[::1",
+        "[]:9050",
+        "[::1]x",
+        "[fe80::1%en0]",
+        "user@host",
+        "host\r\nX-Injected: 1",
+    };
+    for (bad) |host| try std.testing.expectEqual(@as(?[]const u8, null), endpointFromHost(host));
 }
