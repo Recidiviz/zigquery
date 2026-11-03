@@ -26,6 +26,7 @@ const sqlite_c = zigquery.sqlite.c;
 
 const http_server = @import("http/server.zig");
 const router = @import("router.zig");
+const route_table = @import("routes.zig");
 const errors = @import("error.zig");
 const json_pb = @import("json_pb.zig");
 const storage_mod = @import("storage.zig");
@@ -341,14 +342,29 @@ pub const Server = struct {
         }
     }
 
+    /// The discovery document, naming the bind address.
+    pub fn handleDiscovery(s: *Server, req: *const http_server.Request) !http_server.Response {
+        return discovery.handle(req.arena, s.endpoint);
+    }
+
+    /// A start time for recordRoute.
+    pub fn routeClock() u64 {
+        return nowSeed();
+    }
+
+    /// Adds the time since `t0` to the route's /debug/stats entry.
+    pub fn recordRoute(s: *Server, id: router.Route.Id, t0: u64) void {
+        s.route_stats.getPtr(id).record(nowSeed() -| t0);
+    }
+
     fn route(
         s: *Server,
         req: *const http_server.Request,
         m: router.Match,
     ) !http_server.Response {
         return switch (m.route) {
-            .discovery => discovery.handle(req.arena, s.endpoint),
-            .debug_stats => s.handleDebugStats(req),
+            // routes.zig matches these before a request reaches router.zig.
+            .discovery, .debug_stats => unreachable,
             .jobs_query => s.handleQuery(req, m.captures.get(0)),
             .jobs_get_query_results => s.handleGetQueryResults(
                 req,
@@ -456,7 +472,7 @@ pub const Server = struct {
     /// because the emulator is the only place that can measure server-side
     /// request cost, and the recidiviz harness's own stats only work against
     /// the Docker image.
-    fn handleDebugStats(s: *Server, req: *const http_server.Request) !http_server.Response {
+    pub fn handleDebugStats(s: *Server, req: *const http_server.Request) !http_server.Response {
         const arena = req.arena;
         const handle_ns = http_server.stat_handle_ns.load(.monotonic);
         const handle_ms = @as(f64, @floatFromInt(handle_ns)) / 1e6;
@@ -2638,6 +2654,7 @@ fn requestQuery(
         .body = body,
         .arena = arena,
     };
+    if (try route_table.callMatching(s, &req)) |res| return res;
     return s.handler().func(s.handler().ctx, &req);
 }
 
@@ -2669,6 +2686,22 @@ fn cellsOf(arena: std.mem.Allocator, body: []const u8) ![]const []const u8 {
         dst.* = row.object.get("f").?.array.items[0].object.get("v").?.string;
     }
     return out;
+}
+
+test "a routed request is timed under its route, and recordRoute adds one sample" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .GET, "/bigquery/v2/debug/stats", "");
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expectEqual(1, s.route_stats.get(.debug_stats).count);
+
+    s.recordRoute(.discovery, Server.routeClock());
+    try testing.expectEqual(1, s.route_stats.get(.discovery).count);
 }
 
 test "jobs.query returns the Go emulator's response bytes" {

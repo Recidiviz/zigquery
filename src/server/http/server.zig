@@ -1,17 +1,16 @@
 //! Replaces bigquery-emulator's use of net/http + gorilla/mux — REDESIGNED,
 //! not ported. dusty owns the sockets: accepting, HTTP/1.1 parsing,
 //! keep-alive, chunked and gzip request bodies, and `Expect: 100-continue`.
-//! This file turns each request dusty parses into a `Request`, runs the one
-//! `Handler` under its mutex, and writes the `Response` back.
+//! This file turns each request dusty parses into a `Request` and writes the `Response` a
+//! handler returns back. Two global middlewares run around every request: RequestScope settles
+//! the Host-derived endpoint and EngineLock holds the handler's mutex.
 //!
-//! Differences from Go, by design:
-//! - No middleware chain. Go threads request-scoped values through
-//!   context.Context with eight keys (server/context.go) and eleven
-//!   middlewares that populate them; here a `Request` carries what handlers
-//!   need as plain fields.
-//! - No routing here. Every request reaches dusty's not-found hook, and
-//!   src/server/router.zig matches it, because that router binds path
-//!   variables by position and dusty's binds them by name.
+//! Routes come from the `Options.routes` hook. A request no route matches reaches `App.notFound`,
+//! which hands it to the `Handler`.
+//!
+//! Differences from Go, by design: Go threads request-scoped values through context.Context with
+//! eight keys (server/context.go) and eleven middlewares that populate them; here a `Request`
+//! carries what handlers need as plain fields.
 //!
 //! HTTP/1.1 only, cleartext: the BigQuery REST clients speak plain HTTP/1.1
 //! to an emulator.
@@ -43,7 +42,6 @@ pub const Headers = struct {
     /// `bytes 0-524287/2000000`, or `bytes */2000000` on a status query.
     content_range: ?[]const u8 = null,
     /// What a resumable upload says its bytes will be.
-    x_upload_content_type: ?[]const u8 = null,
     x_upload_content_length: ?[]const u8 = null,
 };
 
@@ -129,16 +127,20 @@ pub var stat_waiters_max: std.atomic.Value(u64) = .init(0);
 pub const Options = struct {
     address: []const u8 = "0.0.0.0",
     port: u16 = 9050,
+    /// Registers the routes dusty matches before falling back to `App.notFound`. Runs once the
+    /// global middlewares are in place, because a route keeps the middlewares it was registered
+    /// with.
+    routes: ?*const fn (router: *dusty.Router(App)) void = null,
 };
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    endpoint: Endpoint,
+    app: App,
     listeners: [1]dusty.Listener,
-    inner: dusty.Server(Endpoint),
+    inner: dusty.Server(App),
     /// dusty's global middlewares, run in this order around every request.
-    middlewares: [2]dusty.Middleware(Endpoint) = undefined,
+    middlewares: [2]dusty.Middleware(App) = undefined,
     request_scope: RequestScope = .{},
     engine_lock: EngineLock,
     /// The task running `inner.run`, from `listen` until `serve` or `deinit`
@@ -152,7 +154,7 @@ pub const Server = struct {
     ///
     /// Returns once the socket accepts connections, or with the bind error,
     /// so a caller can announce readiness right after. Heap-allocated because
-    /// dusty keeps a pointer to `endpoint` for the server's life.
+    /// dusty keeps a pointer to `app` for the server's life.
     pub fn listen(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -164,7 +166,7 @@ pub const Server = struct {
         s.* = .{
             .gpa = gpa,
             .io = io,
-            .endpoint = .{ .handler = handler },
+            .app = .{ .handler = handler },
             .engine_lock = .{ .mutex = handler.mutex, .io = handler.io },
             .listeners = .{.{
                 .address = .{ .ip = try std.Io.net.IpAddress.parse(opts.address, opts.port) },
@@ -188,14 +190,15 @@ pub const Server = struct {
                 // this count. Handlers read it raw through Request.queryParam,
                 // so the cap only has to admit what clients send.
                 .max_query_count = 256,
-                // Send 400, 413 and 415 through `Endpoint.uncaughtError`, so
+                // Send 400, 413 and 415 through `App.uncaughtError`, so
                 // they carry the BigQuery error shape like every other error.
                 .answer_client_errors = false,
             },
-        }, &s.endpoint);
+        }, &s.app);
         errdefer s.inner.deinit();
         s.middlewares = .{ .init(&s.request_scope), .init(&s.engine_lock) };
         s.inner.router.middlewares = &s.middlewares;
+        if (opts.routes) |register| register(&s.inner.router);
 
         s.running = try io.concurrent(runInner, .{s});
         s.inner.ready.waitUncancelable(io);
@@ -242,7 +245,7 @@ pub const Server = struct {
 
 /// The app dusty hands every request to. dusty has no routes registered, so
 /// each request reaches `notFound`, which is the dispatch entry point.
-const Endpoint = struct {
+pub const App = struct {
     handler: Handler,
 
     /// What the middlewares settle once per request, for the handler and the error hook.
@@ -252,35 +255,16 @@ const Endpoint = struct {
     };
 
     pub fn notFound(
-        e: *Endpoint,
+        e: *App,
         req: *dusty.Request,
         res: *dusty.Response,
         ctx: *const RequestContext,
     ) !void {
-        const method = methodFrom(req.method) orelse {
+        const r = try requestFrom(req, ctx) orelse {
             res.status = .method_not_allowed;
             return;
         };
-        // dusty's own `path` is percent-decoded; the router matches the
-        // encoded form, so split the raw target instead.
-        const q = std.mem.indexOfScalar(u8, req.url, '?');
-        const r: Request = .{
-            .method = method,
-            .path = if (q) |i| req.url[0..i] else req.url,
-            .query = if (q) |i| req.url[i + 1 ..] else "",
-            .body = try req.body() orelse "",
-            .headers = headersFrom(req),
-            .endpoint = ctx.endpoint,
-            .arena = req.arena,
-        };
-
-        const out = try e.handler.func(e.handler.ctx, &r);
-
-        res.status = std.enums.fromInt(dusty.Status, @intFromEnum(out.status)) orelse
-            return error.UnsupportedStatus;
-        try res.header("Content-Type", out.content_type);
-        for (out.extra_headers) |h| try res.header(h.name, h.value);
-        res.body = out.body;
+        try respond(res, try e.handler.func(e.handler.ctx, &r));
     }
 
     pub fn uncaughtError(
@@ -312,6 +296,32 @@ const Endpoint = struct {
         res.body = internal_error_body;
     }
 };
+
+/// The handler's view of a request dusty parsed, or null for a method outside methodFrom.
+pub fn requestFrom(req: *dusty.Request, ctx: *const App.RequestContext) !?Request {
+    const method = methodFrom(req.method) orelse return null;
+    // dusty's own `path` is percent-decoded; the router.zig fallback matches the encoded form,
+    // so split the raw target instead.
+    const q = std.mem.indexOfScalar(u8, req.url, '?');
+    return .{
+        .method = method,
+        .path = if (q) |i| req.url[0..i] else req.url,
+        .query = if (q) |i| req.url[i + 1 ..] else "",
+        .body = try req.body() orelse "",
+        .headers = headersFrom(req),
+        .endpoint = ctx.endpoint,
+        .arena = req.arena,
+    };
+}
+
+/// Writes a handler's response into dusty's.
+pub fn respond(res: *dusty.Response, out: Response) !void {
+    res.status = std.enums.fromInt(dusty.Status, @intFromEnum(out.status)) orelse
+        return error.UnsupportedStatus;
+    try res.header("Content-Type", out.content_type);
+    for (out.extra_headers) |h| try res.header(h.name, h.value);
+    res.body = out.body;
+}
 
 /// Settles RequestContext.endpoint from the `Host` header.
 const RequestScope = struct {
@@ -435,13 +445,25 @@ fn methodFrom(m: dusty.Method) ?http.Method {
     };
 }
 
+/// dusty's spelling of `m`, for matching a Request built without a socket.
+pub fn dustyMethod(m: http.Method) dusty.Method {
+    return switch (m) {
+        inline else => |tag| comptime blk: {
+            const name = @tagName(tag);
+            var lower: [name.len]u8 = undefined;
+            _ = std.ascii.lowerString(&lower, name);
+            const spelled = lower;
+            break :blk @field(dusty.Method, &spelled);
+        },
+    };
+}
+
 /// The allow-listed headers, borrowed from the request head, which outlives
 /// the handler.
 fn headersFrom(req: *const dusty.Request) Headers {
     return .{
         .content_type = req.headers.get("content-type"),
         .content_range = req.headers.get("content-range"),
-        .x_upload_content_type = req.headers.get("x-upload-content-type"),
         .x_upload_content_length = req.headers.get("x-upload-content-length"),
     };
 }

@@ -69,10 +69,6 @@ pub const Route = struct {
 
 /// The implemented surface.
 pub const routes = [_]Route{
-    .{ .id = .discovery, .method = .GET, .pattern = "/discovery/v1/apis/bigquery/v2/rest" },
-    .{ .id = .discovery, .method = .GET, .pattern = "/$discovery/rest" },
-    // Not part of the BigQuery API: per-route timing for this process.
-    .{ .id = .debug_stats, .method = .GET, .pattern = "/debug/stats" },
     .{ .id = .jobs_query, .method = .POST, .pattern = "/projects/*/queries" },
     .{ .id = .jobs_get_query_results, .method = .GET, .pattern = "/projects/*/queries/*" },
     .{ .id = .jobs_insert, .method = .POST, .pattern = "/projects/*/jobs" },
@@ -197,9 +193,6 @@ test "every route is reachable under the /bigquery/v2 prefix too" {
     const prefixed = match(.POST, "/bigquery/v2/projects/p/queries");
     try testing.expectEqual(bare.matched.route, prefixed.matched.route);
     try testing.expectEqualStrings("p", prefixed.matched.captures.get(0));
-
-    const d = match(.GET, "/bigquery/v2/discovery/v1/apis/bigquery/v2/rest");
-    try testing.expectEqual(Route.Id.discovery, d.matched.route);
 }
 
 test "same path, different methods, different routes" {

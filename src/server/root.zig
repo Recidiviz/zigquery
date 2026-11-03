@@ -10,6 +10,7 @@
 
 pub const http_server = @import("http/server.zig");
 pub const router = @import("router.zig");
+pub const routes = @import("routes.zig");
 pub const errors = @import("error.zig");
 pub const json_pb = @import("json_pb.zig");
 pub const debug_stats = @import("debug_stats.zig");

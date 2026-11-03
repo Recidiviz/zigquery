@@ -147,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
     const server = try http_server.Server.listen(gpa, io, .{
         .address = opts.host,
         .port = opts.port,
+        .routes = bqserver.routes.register,
     }, app.handler());
     defer server.deinit();
 
