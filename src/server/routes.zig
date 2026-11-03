@@ -57,31 +57,41 @@ pub const Entry = struct {
     call: Call,
 };
 
-const tables_one = "/projects/:project/datasets/:dataset/tables/:table";
-const upload_jobs = "/upload/bigquery/v2/projects/:project/jobs";
+const project = "/projects/:project";
+const datasets = project ++ "/datasets";
+const dataset = datasets ++ "/:dataset";
+const tables = dataset ++ "/tables";
+const one_table = tables ++ "/:table";
+const queries = project ++ "/queries";
+const jobs = project ++ "/jobs";
+const upload_jobs = "/upload/bigquery/v2" ++ jobs;
 
 pub const table = [_]Entry{
     route(.GET, "/discovery/v1/apis/bigquery/v2/rest", .discovery, Server.handleDiscovery),
     route(.GET, "/$discovery/rest", .discovery, Server.handleDiscovery),
     // Not part of the BigQuery API: per-route timing for this process.
     route(.GET, "/debug/stats", .debug_stats, Server.handleDebugStats),
-    route(.POST, "/projects/:project/datasets", .datasets_insert, Server.handleDatasetsInsert),
-    route(.GET, "/projects/:project/datasets", .datasets_list, Server.handleDatasetsList),
-    route(.GET, "/projects/:project/datasets/:dataset", .datasets_get, Server.handleDatasetsGet),
-    route(.DELETE, "/projects/:project/datasets/:dataset", .datasets_delete, Server.handleDatasetsDelete),
-    route(.PATCH, "/projects/:project/datasets/:dataset", .datasets_patch, Server.handleDatasetsPatch),
-    route(.POST, "/projects/:project/datasets/:dataset/tables", .tables_insert, Server.handleTablesInsert),
-    route(.GET, "/projects/:project/datasets/:dataset/tables", .tables_list, Server.handleTablesList),
-    route(.GET, tables_one, .tables_get, Server.handleTablesGet),
-    route(.PATCH, tables_one, .tables_patch, Server.handleTablesPatch),
-    route(.DELETE, tables_one, .tables_delete, Server.handleTablesDelete),
-    route(.GET, tables_one ++ "/data", .tabledata_list, Server.handleTabledataList),
-    route(.POST, tables_one ++ "/insertAll", .tabledata_insert_all, Server.handleTabledataInsertAll),
-    route(.POST, "/projects/:project/queries", .jobs_query, Server.handleQuery),
-    route(.GET, "/projects/:project/queries/:job", .jobs_get_query_results, Server.handleGetQueryResults),
-    route(.POST, "/projects/:project/jobs", .jobs_insert, Server.handleJobsInsert),
-    route(.GET, "/projects/:project/jobs", .jobs_list, Server.handleJobsList),
-    route(.GET, "/projects/:project/jobs/:job", .jobs_get, Server.handleJobsGet),
+
+    route(.POST, datasets, .datasets_insert, Server.handleDatasetsInsert),
+    route(.GET, datasets, .datasets_list, Server.handleDatasetsList),
+    route(.GET, dataset, .datasets_get, Server.handleDatasetsGet),
+    route(.DELETE, dataset, .datasets_delete, Server.handleDatasetsDelete),
+    route(.PATCH, dataset, .datasets_patch, Server.handleDatasetsPatch),
+
+    route(.POST, tables, .tables_insert, Server.handleTablesInsert),
+    route(.GET, tables, .tables_list, Server.handleTablesList),
+    route(.GET, one_table, .tables_get, Server.handleTablesGet),
+    route(.PATCH, one_table, .tables_patch, Server.handleTablesPatch),
+    route(.DELETE, one_table, .tables_delete, Server.handleTablesDelete),
+    route(.GET, one_table ++ "/data", .tabledata_list, Server.handleTabledataList),
+    route(.POST, one_table ++ "/insertAll", .tabledata_insert_all, Server.handleTabledataInsertAll),
+
+    route(.POST, queries, .jobs_query, Server.handleQuery),
+    route(.GET, queries ++ "/:job", .jobs_get_query_results, Server.handleGetQueryResults),
+    route(.POST, jobs, .jobs_insert, Server.handleJobsInsert),
+    route(.GET, jobs, .jobs_list, Server.handleJobsList),
+    route(.GET, jobs ++ "/:job", .jobs_get, Server.handleJobsGet),
+
     // The media upload endpoint. The discovery document gives the resumable protocol its own
     // `/resumable` prefix while the prose uses `/upload` with `uploadType=resumable`, so both
     // spellings reach the same handlers. api-uploads
