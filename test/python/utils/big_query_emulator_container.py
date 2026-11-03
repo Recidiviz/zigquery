@@ -17,6 +17,7 @@ import time
 from typing import IO
 
 from testcontainers.core.container import DockerContainer
+from testcontainers.core.network import Network
 from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
 BQ_EMULATOR_PROJECT_ID = "bigquery-emulator-test"
@@ -69,6 +70,47 @@ EMULATOR_IMAGE = f"{EMULATOR_IMAGE_REPOSITORY}:{EMULATOR_VERSION}"
 
 EMULATOR_BINARY = os.getenv("BIGQUERY_EMULATOR_BINARY")
 
+# fake-gcs-server 1.56.1, pinned by its multi-platform index digest.
+FAKE_GCS_IMAGE = (
+    "fsouza/fake-gcs-server@sha256:"
+    "797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
+)
+FAKE_GCS_CONTAINER_PORT = 4443
+# The name an emulator container reaches fake-gcs-server by on their shared network.
+FAKE_GCS_ALIAS = "fake-gcs"
+
+
+def get_fake_gcs_port() -> int:
+    """Returns the host port fake-gcs-server publishes for the current pytest worker."""
+    return 62050 + get_pytest_worker_id()
+
+
+class FakeGcs(DockerContainer):
+    """fake-gcs-server over plain HTTP, for load jobs that read gs:// objects.
+
+    The tests seed buckets and objects through get_url(). An emulator container reaches it by
+    FAKE_GCS_ALIAS on network; a local emulator process reaches it through get_url().
+    """
+
+    def __init__(self, network: Network | None = None):
+        super().__init__(FAKE_GCS_IMAGE)
+        self.port = get_fake_gcs_port()
+        self.network = network
+        self.with_bind_ports(FAKE_GCS_CONTAINER_PORT, self.port)
+        if network is not None:
+            self.with_network(network).with_network_aliases(FAKE_GCS_ALIAS)
+        self.with_command(["-scheme", "http", "-port", str(FAKE_GCS_CONTAINER_PORT)])
+        self.waiting_for(LogMessageWaitStrategy("server started at"))
+
+    def get_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def emulator_host(self) -> str:
+        """The STORAGE_EMULATOR_HOST an emulator running the way this suite runs it uses."""
+        if self.network is not None:
+            return f"http://{FAKE_GCS_ALIAS}:{FAKE_GCS_CONTAINER_PORT}"
+        return self.get_url()
+
 
 def _emulator_args(port: int, grpc_port: int, data_from_json: str | None) -> list[str]:
     args = [
@@ -111,6 +153,7 @@ class BigQueryEmulatorContainer(DockerContainer):
         port: int | None = None,
         grpc_port: int | None = None,
         input_schema_json_path: str | None = None,
+        storage: FakeGcs | None = None,
         **kwargs
     ):
         """Initialize BigQuery emulator container.
@@ -122,6 +165,7 @@ class BigQueryEmulatorContainer(DockerContainer):
             grpc_port: gRPC port to expose. Defaults to port based on pytest worker ID.
             input_schema_json_path: Optional path to JSON file containing schema data
                                    to load on startup.
+            storage: fake-gcs-server for gs:// load jobs. The emulator joins its network.
             **kwargs: Additional arguments to pass to DockerContainer.
         """
         image = image or EMULATOR_IMAGE
@@ -147,6 +191,11 @@ class BigQueryEmulatorContainer(DockerContainer):
 
         # The image's ENTRYPOINT is the server, so the command is its flags alone.
         self.with_command(_emulator_args(self.port, self.grpc_port, data_from_json))
+
+        if storage is not None:
+            assert storage.network is not None, "an emulator container needs a network"
+            self.with_network(storage.network)
+            self.with_env("STORAGE_EMULATOR_HOST", storage.emulator_host())
 
         self.waiting_for(LogMessageWaitStrategy(READY_LOG_LINE))
 
@@ -177,8 +226,12 @@ class BigQueryEmulatorProcess:
         grpc_port: int | None = None,
         input_schema_json_path: str | None = None,
         startup_timeout_seconds: float = 30.0,
+        storage: FakeGcs | None = None,
     ):
         self.binary = binary
+        self.env = dict(os.environ)
+        if storage is not None:
+            self.env["STORAGE_EMULATOR_HOST"] = storage.emulator_host()
         self.port = port or get_bq_emulator_port()
         self.grpc_port = grpc_port or get_bq_emulator_grpc_port()
         self.input_schema_json_path = input_schema_json_path
@@ -194,6 +247,7 @@ class BigQueryEmulatorProcess:
             [self.binary, *_emulator_args(self.port, self.grpc_port, self.input_schema_json_path)],
             stdout=self._stdout,
             stderr=self._stderr,
+            env=self.env,
         )
         deadline = time.monotonic() + self.startup_timeout_seconds
         while time.monotonic() < deadline:
@@ -248,11 +302,23 @@ class BigQueryEmulatorProcess:
 BigQueryEmulator = BigQueryEmulatorContainer | BigQueryEmulatorProcess
 
 
-def create_emulator(input_schema_json_path: str | None = None) -> BigQueryEmulator:
+def create_emulator(
+    input_schema_json_path: str | None = None, storage: FakeGcs | None = None
+) -> BigQueryEmulator:
     """The emulator for this environment: the local binary when
     BIGQUERY_EMULATOR_BINARY is set, the Docker image otherwise."""
     if EMULATOR_BINARY:
         return BigQueryEmulatorProcess(
-            EMULATOR_BINARY, input_schema_json_path=input_schema_json_path
+            EMULATOR_BINARY,
+            input_schema_json_path=input_schema_json_path,
+            storage=storage,
         )
-    return BigQueryEmulatorContainer(input_schema_json_path=input_schema_json_path)
+    return BigQueryEmulatorContainer(
+        input_schema_json_path=input_schema_json_path, storage=storage
+    )
+
+
+def create_fake_gcs() -> FakeGcs:
+    """fake-gcs-server for this environment, on its own network when the emulator runs as
+    a container. The caller starts it, and stops it and its network after the emulator."""
+    return FakeGcs(network=None if EMULATOR_BINARY else Network().create())

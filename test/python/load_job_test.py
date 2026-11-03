@@ -10,6 +10,7 @@ Where a behaviour was measured against real BigQuery the case carries the date.
 import io
 import json
 
+import requests
 from google.api_core import exceptions
 from google.cloud import bigquery
 from google.cloud.bigquery import LoadJobConfig, SchemaField, SourceFormat
@@ -232,17 +233,6 @@ class TestLoadJobs(BigQueryEmulatorTestCase):
 
     # ---- refusals ----
 
-    def test_source_uris_are_refused(self) -> None:
-        """There is nowhere for the emulator to read a gs:// object from."""
-        job_config = LoadJobConfig(source_format=SourceFormat.CSV, autodetect=True)
-        with self.assertRaises(exceptions.BadRequest) as caught:
-            self.client.load_table_from_uri(
-                "gs://bucket/object.csv",
-                self._table_ref("from_uri"),
-                job_config=job_config,
-            )
-        self.assertIn("sourceUris", str(caught.exception))
-
     def test_a_format_this_emulator_cannot_read_is_refused(self) -> None:
         job_config = LoadJobConfig(source_format=SourceFormat.PARQUET)
         with self.assertRaises(exceptions.BadRequest) as caught:
@@ -271,3 +261,77 @@ class TestLoadJobs(BigQueryEmulatorTestCase):
         replayed = self.client.get_job(job.job_id)
         self.assertIsInstance(replayed, bigquery.LoadJob)
         self.assertEqual("DONE", replayed.state)
+
+
+_BUCKET = "zigquery-python-staging"
+
+
+class TestLoadJobsFromCloudStorage(BigQueryEmulatorTestCase):
+    """Load jobs that read gs:// objects from fake-gcs-server."""
+
+    with_cloud_storage = True
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        storage = cls.cloud_storage.get_url()
+        requests.post(f"{storage}/storage/v1/b", json={"name": _BUCKET}).raise_for_status()
+        objects = {
+            "single/people.csv": "1,NORTH\n2,SOUTH\n",
+            "shards/part-000.csv": "person_id,district\n1,NORTH\n",
+            "shards/part-001.csv": "person_id,district\n2,SOUTH\n",
+            "shards/manifest.json": '{"files":2}\n',
+        }
+        for name, body in objects.items():
+            requests.post(
+                f"{storage}/upload/storage/v1/b/{_BUCKET}/o",
+                params={"uploadType": "media", "name": name},
+                data=body.encode(),
+            ).raise_for_status()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client.create_dataset(_DATASET, exists_ok=True)
+
+    def _load_uri(self, table_id: str, uri: str, **config) -> bigquery.LoadJob:
+        table = self.client.create_table(
+            bigquery.Table(
+                bigquery.TableReference(
+                    bigquery.DatasetReference(BQ_EMULATOR_PROJECT_ID, _DATASET), table_id
+                ),
+                schema=[
+                    SchemaField("person_id", "INTEGER"),
+                    SchemaField("district", "STRING"),
+                ],
+            )
+        )
+        job = self.client.load_table_from_uri(
+            uri,
+            table,
+            job_config=LoadJobConfig(source_format=SourceFormat.CSV, **config),
+        )
+        job.result()
+        return job
+
+    def _rows(self, table_id: str) -> list[tuple]:
+        job = self.client.query(
+            f"SELECT person_id, district FROM `{BQ_EMULATOR_PROJECT_ID}.{_DATASET}.{table_id}` "
+            "ORDER BY person_id"
+        )
+        return [tuple(row.values()) for row in job.result()]
+
+    def test_a_gs_uri_loads_its_object(self) -> None:
+        job = self._load_uri("from_gcs", f"gs://{_BUCKET}/single/people.csv")
+        self.assertEqual(1, job.input_files)
+        self.assertEqual([(1, "NORTH"), (2, "SOUTH")], self._rows("from_gcs"))
+
+    def test_a_wildcard_loads_every_match_skipping_each_header(self) -> None:
+        job = self._load_uri(
+            "from_shards", f"gs://{_BUCKET}/shards/part-*.csv", skip_leading_rows=1
+        )
+        self.assertEqual(2, job.input_files)
+        self.assertEqual([(1, "NORTH"), (2, "SOUTH")], self._rows("from_shards"))
+
+    def test_a_missing_object_fails_the_job_as_not_found(self) -> None:
+        with self.assertRaises(exceptions.NotFound):
+            self._load_uri("from_absent", f"gs://{_BUCKET}/single/absent.csv")

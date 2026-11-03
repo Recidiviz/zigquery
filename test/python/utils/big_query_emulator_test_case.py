@@ -28,7 +28,9 @@ from pandas_gbq import read_gbq as og_read_gbq
 from utils.big_query_emulator_container import (
     BQ_EMULATOR_PROJECT_ID,
     BigQueryEmulator,
+    FakeGcs,
     create_emulator,
+    create_fake_gcs,
 )
 
 
@@ -101,10 +103,19 @@ class BigQueryEmulatorTestCase(unittest.TestCase):
     # If the test failed, output the emulator logs prior to exiting
     show_emulator_logs_on_failure = False
 
+    # Subclasses that load gs:// objects set this to run fake-gcs-server beside the emulator,
+    # which then reads it through STORAGE_EMULATOR_HOST.
+    with_cloud_storage = False
+    cloud_storage: FakeGcs | None = None
+
     @classmethod
     def setUpClass(cls) -> None:
+        if cls.with_cloud_storage:
+            cls.cloud_storage = create_fake_gcs()
+            cls.cloud_storage.start()
         cls.emulator = create_emulator(
-            input_schema_json_path=cls.input_json_schema_path
+            input_schema_json_path=cls.input_json_schema_path,
+            storage=cls.cloud_storage,
         )
         cls.emulator.start()
 
@@ -171,6 +182,11 @@ class BigQueryEmulatorTestCase(unittest.TestCase):
             print(logs)
 
         cls.emulator.stop()
+        if cls.cloud_storage is not None:
+            cls.cloud_storage.stop()
+            if cls.cloud_storage.network is not None:
+                cls.cloud_storage.network.remove()
+            cls.cloud_storage = None
 
         if cls.input_json_schema_path and cls.delete_json_input_schema_on_teardown:
             os.remove(cls.input_json_schema_path)

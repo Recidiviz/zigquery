@@ -1,5 +1,4 @@
-// Load jobs: Table.load sends a local file as a multipart upload; a storage File becomes a
-// gs:// source URI on jobs.insert.
+// Load jobs from a local file, which Table.load sends as a multipart upload.
 
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile } from 'node:fs/promises';
@@ -14,23 +13,6 @@ const SCHEMA = [
   { name: 'person_id', type: 'INTEGER' },
   { name: 'district', type: 'STRING' },
 ];
-
-// Table.createLoadJob recognises a @google-cloud/storage File by its constructor names and its
-// parent chain, and reads only bucket.name and name from it.
-class Storage {}
-class Bucket {
-  constructor(name) {
-    this.name = name;
-    this.parent = new Storage();
-  }
-}
-class File {
-  constructor(bucket, name) {
-    this.bucket = bucket;
-    this.name = name;
-    this.parent = bucket;
-  }
-}
 
 async function emptyTable(prefix) {
   const [dataset] = await emulator.client.createDataset(uniqueDatasetId(prefix));
@@ -53,11 +35,4 @@ test('Table.load uploads a local CSV file', async () => {
     { person_id: 1, district: 'NORTH' },
     { person_id: 2, district: 'SOUTH' },
   ]);
-});
-
-test('createLoadJob accepts a gs:// source', async () => {
-  const table = await emptyTable('gcs');
-  const source = new File(new Bucket('zigquery-node-test'), 'people.csv');
-  const [job] = await table.createLoadJob(source, { sourceFormat: 'CSV' });
-  assert.equal(job.metadata.configuration.load.sourceUris[0], 'gs://zigquery-node-test/people.csv');
 });
