@@ -74,9 +74,57 @@ pub fn read(
     spec: load_handler.LoadSpec,
     existing: ?*const spec_mod.TableSpec,
 ) Error!Reading {
+    return readOne(arena, media, spec, try declaredColumns(arena, spec, existing));
+}
+
+/// Reads several sources as one load. The first decides the columns, as a single source does;
+/// the rest are read under those columns, each skipping its own leading rows.
+pub fn readMany(
+    arena: std.mem.Allocator,
+    sources: []const []const u8,
+    spec: load_handler.LoadSpec,
+    existing: ?*const spec_mod.TableSpec,
+) Error!Reading {
+    std.debug.assert(sources.len != 0);
+    var reading = try readOne(arena, sources[0], spec, try declaredColumns(arena, spec, existing));
+    if (sources.len == 1) return reading;
+
+    switch (reading.source) {
+        .csv => |first| {
+            var rows: std.ArrayList(csv.Row) = .empty;
+            try rows.appendSlice(arena, first);
+            for (sources[1..]) |media| {
+                const next = try readOne(arena, media, spec, reading.columns);
+                try rows.appendSlice(arena, next.source.csv);
+                reading.bad_records += next.bad_records;
+            }
+            reading.source = .{ .csv = rows.items };
+        },
+        .json => |first| {
+            var rows: std.ArrayList(std.json.Value) = .empty;
+            try rows.appendSlice(arena, first);
+            for (sources[1..]) |media| {
+                const next = try readOne(arena, media, spec, reading.columns);
+                try rows.appendSlice(arena, next.source.json);
+                reading.bad_records += next.bad_records;
+            }
+            reading.source = .{ .json = rows.items };
+        },
+    }
+    return reading;
+}
+
+/// Args:
+///   declared: the columns the source is read under, or null to detect them from it.
+fn readOne(
+    arena: std.mem.Allocator,
+    media: []const u8,
+    spec: load_handler.LoadSpec,
+    declared: ?[]const Column,
+) Error!Reading {
     return switch (spec.source_format) {
-        .CSV => readCsv(arena, media, spec, existing),
-        .NEWLINE_DELIMITED_JSON => readJson(arena, media, spec, existing),
+        .CSV => readCsv(arena, media, spec, declared),
+        .NEWLINE_DELIMITED_JSON => readJson(arena, media, spec, declared),
     };
 }
 
@@ -167,7 +215,7 @@ fn readCsv(
     arena: std.mem.Allocator,
     media: []const u8,
     spec: load_handler.LoadSpec,
-    existing: ?*const spec_mod.TableSpec,
+    declared: ?[]const Column,
 ) Error!Reading {
     const parsed = csv.parse(arena, media, .{
         .field_delimiter = spec.field_delimiter,
@@ -184,7 +232,7 @@ fn readCsv(
         d.data_start
     else if (spec.skip_leading_rows) |n| n else 0;
 
-    const columns = (try declaredColumns(arena, spec, existing)) orelse
+    const columns = declared orelse
         try detectedColumns(arena, detection orelse return error.NoSchema);
 
     const schema_node = try schemaNodeFrom(arena, columns);
@@ -338,7 +386,7 @@ fn readJson(
     arena: std.mem.Allocator,
     media: []const u8,
     spec: load_handler.LoadSpec,
-    existing: ?*const spec_mod.TableSpec,
+    declared: ?[]const Column,
 ) Error!Reading {
     var objects = std.json.Array.init(arena);
     var bad: u64 = 0;
@@ -355,7 +403,7 @@ fn readJson(
         try objects.append(value);
     }
 
-    const columns = (try declaredColumns(arena, spec, existing)) orelse blk: {
+    const columns = declared orelse blk: {
         if (!spec.autodetect) return error.NoSchema;
         break :blk try jsonColumns(arena, objects.items);
     };
@@ -590,6 +638,47 @@ test "a load that names no schema at all cannot proceed" {
     try testing.expectError(error.NoSchema, readFrom(arena, "1,2\n", .{
         .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
     }));
+}
+
+test "several sources each skip their own header and take the first one's columns" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spec: load_handler.LoadSpec = .{
+        .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
+        .autodetect = true,
+        .skip_leading_rows = 1,
+    };
+    const reading = try readMany(arena, &.{
+        "person_id,district\n1,NORTH\n",
+        "person_id,district\n2,SOUTH\n3,EAST",
+        "person_id,district\n4,WEST\n",
+    }, spec, null);
+    const collected = try collect(arena, reading, spec);
+    try testing.expectEqual(@as(usize, 4), collected.rows.len);
+    try testing.expectEqual(@as(u64, 0), collected.bad_records);
+    try testing.expectEqualStrings("SOUTH", collected.rows[1].object.get("district").?.string);
+    try testing.expectEqualStrings("EAST", collected.rows[2].object.get("district").?.string);
+    try testing.expectEqual(@as(i64, 4), collected.rows[3].object.get("person_id").?.integer);
+}
+
+test "bad records count across every source of a load" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spec: load_handler.LoadSpec = .{
+        .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
+        .source_format = .NEWLINE_DELIMITED_JSON,
+        .autodetect = true,
+    };
+    const reading = try readMany(arena, &.{
+        "{\"n\":1}\nnot json\n",
+        "{\"n\":2}\n{oops\n",
+    }, spec, null);
+    try testing.expectEqual(@as(usize, 2), reading.rowCount());
+    try testing.expectEqual(@as(u64, 2), reading.bad_records);
 }
 
 test "every read error has a message of its own" {

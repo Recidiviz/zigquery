@@ -27,6 +27,10 @@ const usage =
     \\                          keeps data in memory (default: :memory:)
     \\  --data-from-json=<path> load datasets and tables from a JSON file at
     \\                          startup; repeatable, files load in order
+    \\  --storage-emulator-host=<addr>
+    \\                          Cloud Storage emulator that load jobs read gs://
+    \\                          sources from, as host:port or http://host:port
+    \\                          (default: $STORAGE_EMULATOR_HOST)
     \\  --log-level=<level>     accepted for compatibility; currently ignored
     \\  --log-format=<format>   accepted for compatibility; currently ignored
     \\  -h, --help              show this help and exit
@@ -41,6 +45,7 @@ const Options = struct {
     log_level: []const u8 = "error",
     database: ?[]const u8 = null,
     log_format: []const u8 = "console",
+    storage_emulator_host: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -63,7 +68,9 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buf);
     const err_out = &stderr_writer.interface;
 
-    var opts = Options{};
+    var opts = Options{
+        .storage_emulator_host = init.environ_map.get("STORAGE_EMULATOR_HOST"),
+    };
     var json_paths: std.ArrayList([]const u8) = .empty;
     defer json_paths.deinit(gpa);
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -94,6 +101,8 @@ pub fn main(init: std.process.Init) !void {
             try json_paths.append(gpa, v);
         } else if (flagValue(arg, "--log-format")) |v| {
             opts.log_format = v;
+        } else if (flagValue(arg, "--storage-emulator-host")) |v| {
+            opts.storage_emulator_host = v;
         } else {
             try err_out.print("unknown flag: {s}\n\n" ++ usage, .{arg});
             try err_out.flush();
@@ -118,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
         .port = opts.port,
         .data_from_json = json_paths.items,
         .dataset = opts.dataset,
+        .storage_emulator_host = opts.storage_emulator_host,
     }) catch |err| switch (err) {
         error.DatabaseOpenFailed => std.process.exit(1),
         else => return err,

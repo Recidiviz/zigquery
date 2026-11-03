@@ -1,10 +1,11 @@
 //! Load jobs: the `configuration.load` half of jobs.insert.
 //!
-//! A load job reads rows out of bytes the client uploaded and writes them into one destination
-//! table. Its configuration and its data arrive together, so everything that can be settled
-//! without writing a row is settled before a job exists. docs/adr/0002
+//! A load job reads rows out of bytes the client uploaded, or out of the gs:// objects its
+//! sourceUris name, and writes them into one destination table. Everything that can be settled
+//! without reading a row is settled before a job exists. docs/adr/0002
 
 const std = @import("std");
+const gcs = @import("../gcs.zig");
 const pb = @import("../proto/bigquery.zig");
 
 /// The formats this emulator reads. The member names are the wire values.
@@ -45,6 +46,8 @@ pub const TableRef = struct {
 /// What a load job was asked to do, once the wire form has been normalised.
 pub const LoadSpec = struct {
     destination: TableRef,
+    /// gs:// URIs, each one Uri.parse accepts. Empty for an upload, which carries its data.
+    source_uris: []const []const u8 = &.{},
     source_format: SourceFormat = .CSV,
     write_disposition: WriteDisposition = .WRITE_APPEND,
     create_disposition: CreateDisposition = .CREATE_IF_NEEDED,
@@ -88,8 +91,8 @@ pub const ParseError = error{
     /// A delimiter or quote that is not one byte.
     InvalidDelimiter,
     InvalidQuote,
-    /// `sourceUris` names data this emulator has nowhere to read from.
-    SourceUrisUnsupported,
+    /// A sourceUris entry that is not gs://bucket/object with at most one wildcard.
+    InvalidSourceUri,
     /// WRITE_TRUNCATE_DATA, or a schema update option. Each changes an existing table's
     /// schema as a side effect.
     UnsupportedDisposition,
@@ -117,12 +120,18 @@ fn oneByte(text: []const u8) ?u8 {
 /// Normalises `configuration.load`. Null when the job is not a load job.
 pub fn parse(job: *const pb.Job) ParseError!?LoadSpec {
     const cfg = loadConfig(job) orelse return null;
-    if (cfg.source_uris.len != 0) return error.SourceUrisUnsupported;
+    for (cfg.source_uris) |uri| {
+        if (gcs.Uri.parse(uri) == null) return error.InvalidSourceUri;
+    }
     if (cfg.schema_update_options.len != 0) return error.SchemaUpdateUnsupported;
 
     const dest = cfg.destination_table orelse return error.NoDestinationTable;
 
-    var spec = LoadSpec{ .destination = try refFrom(dest), .schema = cfg.schema };
+    var spec = LoadSpec{
+        .destination = try refFrom(dest),
+        .source_uris = cfg.source_uris,
+        .schema = cfg.schema,
+    };
     try readDispositions(cfg, &spec);
     readRowOptions(cfg, &spec);
     try readCsvSyntax(cfg, &spec);
@@ -191,8 +200,8 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
             "CREATE_IF_NEEDED or CREATE_NEVER",
         error.InvalidDelimiter => "configuration.load.fieldDelimiter must be one byte",
         error.InvalidQuote => "configuration.load.quote must be one byte, or empty for none",
-        error.SourceUrisUnsupported => "configuration.load.sourceUris is not supported: " ++
-            "upload the data instead",
+        error.InvalidSourceUri => "configuration.load.sourceUris entries must be " ++
+            "gs://bucket/object, with at most one * in the object name",
         error.UnsupportedDisposition => "configuration.load.writeDisposition: " ++
             "WRITE_TRUNCATE_DATA is not supported",
         error.SchemaUpdateUnsupported => "configuration.load.schemaUpdateOptions is not " ++
@@ -205,6 +214,7 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
 
 /// What a load job counts while it runs. rest/v2/Job#jobstatistics3
 pub const Counts = struct {
+    input_files: u64 = 1,
     input_file_bytes: u64 = 0,
     output_rows: u64 = 0,
     bad_records: u64 = 0,
@@ -241,6 +251,7 @@ pub fn writeJobResource(
         .table_id = j.load.destination.table_id,
     };
     var cfg_load = pb.JobConfigurationLoad{
+        .source_uris = @constCast(j.load.source_uris),
         .destination_table = &dest,
         .source_format = @tagName(j.load.source_format),
         .write_disposition = @tagName(j.load.write_disposition),
@@ -256,6 +267,7 @@ pub fn writeJobResource(
     var stats_load = pb.JobStatistics3{};
     switch (j.outcome) {
         .loaded => |counts| {
+            input_files.value = @intCast(counts.input_files);
             input_bytes.value = @intCast(counts.input_file_bytes);
             output_rows.value = @intCast(counts.output_rows);
             bad_records.value = @intCast(counts.bad_records);
@@ -370,16 +382,23 @@ test "a format this emulator cannot read is refused" {
     try testing.expectError(error.UnsupportedSourceFormat, parse(job));
 }
 
-test "sourceUris names data there is nowhere to read from" {
+test "sourceUris are kept, and one that is not a gs:// object is refused" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const job = try loadJob(arena,
-        \\{"configuration":{"load":{"sourceUris":["gs://bucket/object.csv"],
+        \\{"configuration":{"load":{"sourceUris":["gs://staging/part-*.csv"],
         \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
     );
-    try testing.expectError(error.SourceUrisUnsupported, parse(job));
+    const spec = (try parse(job)).?;
+    try testing.expectEqualStrings("gs://staging/part-*.csv", spec.source_uris[0]);
+
+    const bad = try loadJob(arena,
+        \\{"configuration":{"load":{"sourceUris":["gs://staging/*/part-*.csv"],
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expectError(error.InvalidSourceUri, parse(bad));
 }
 
 test "the dispositions that change an existing table's schema are refused" {

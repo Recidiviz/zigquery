@@ -23,9 +23,7 @@ from utils.big_query_emulator_test_case import RESUMABLE_RETRYABLE_WITHOUT_500
 # Tests this emulator does not pass yet, by node ID prefix. Strict: a test that
 # starts passing fails the run until its entry is removed, so this list cannot
 # go stale in the permissive direction.
-KNOWN_FAILURES: dict[str, str] = {
-    "load_job_test.py::TestLoadJobsFromCloudStorage": "configuration.load.sourceUris is refused",
-}
+KNOWN_FAILURES: dict[str, str] = {}
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

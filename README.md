@@ -30,6 +30,9 @@ Options:
   --grpc-port=<port>      Storage Read API gRPC port; 0 picks a free port (default: 9060)
   --database=<path>       SQLite file to store data in; :memory: or empty keeps data in memory (default: :memory:)
   --data-from-json=<path> load datasets and tables from a JSON file at startup; repeatable, files load in order
+  --storage-emulator-host=<addr>
+                          Cloud Storage emulator that load jobs read gs:// sources from, as host:port or
+                          http://host:port (default: $STORAGE_EMULATOR_HOST)
   --log-level=<level>     accepted for compatibility; currently ignored
   --log-format=<format>   accepted for compatibility; currently ignored
   -h, --help              show this help and exit
@@ -41,6 +44,31 @@ To keep data across restarts, mount a volume at `/data`, which the image's `nonr
 docker run -p 9050:9050 -v zigquery-data:/data ghcr.io/recidiviz/zigquery:latest \
   --project=my-project --database=/data/bigquery.db
 ```
+
+### Loading from Cloud Storage
+
+Load jobs whose `sourceUris` name `gs://` objects read them from a Cloud Storage emulator such
+as [fake-gcs-server](https://github.com/fsouza/fake-gcs-server), never from real Cloud Storage.
+Point the emulator at it with `STORAGE_EMULATOR_HOST`, the variable the Google client libraries
+already read, or with `--storage-emulator-host`. A URI may hold one `*` wildcard, and each
+matching object is read in name order. CSV and newline-delimited JSON are supported, up to
+256 MiB per load job.
+
+```yaml
+services:
+  gcs:
+    image: fsouza/fake-gcs-server:1.56.1
+    command: ["-scheme", "http", "-port", "4443"]
+  bigquery:
+    image: ghcr.io/recidiviz/zigquery:latest
+    command: ["--project=local-project", "--port=9050"]
+    environment:
+      STORAGE_EMULATOR_HOST: http://gcs:4443
+    ports: ["9050:9050"]
+```
+
+Your own services can use the same `STORAGE_EMULATOR_HOST` to stage objects in the bucket a
+load job then reads.
 
 ## Development
 
