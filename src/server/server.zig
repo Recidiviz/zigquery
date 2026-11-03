@@ -6062,10 +6062,13 @@ test "an empty storage emulator host leaves gs:// loads failing the job" {
 }
 
 test "a real Cloud Storage host as the storage emulator stops startup" {
-    try testing.expectError(error.RealCloudStorageHost, Server.init(testing.allocator, testing.io, .{
-        .project = "test",
-        .storage_emulator_host = "https://storage.googleapis.com",
-    }));
+    try testing.expectError(
+        error.RealCloudStorageHost,
+        Server.init(testing.allocator, testing.io, .{
+            .project = "test",
+            .storage_emulator_host = "https://storage.googleapis.com",
+        }),
+    );
 }
 
 test "several sources concatenate into one destination" {
