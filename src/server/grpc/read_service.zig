@@ -574,7 +574,8 @@ pub const Service = struct {
             ref.dataset,
             ref.table,
         )) orelse return null;
-        return app.tableResource(arena, table_spec) catch |err| {
+        // No HTTP request here, so the bind address stays the endpoint.
+        return app.tableResource(arena, app.endpoint, table_spec) catch |err| {
             log.err("rendering {s}.{s}.{s} failed: {t}", .{
                 ref.project,
                 ref.dataset,

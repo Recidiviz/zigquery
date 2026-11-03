@@ -324,6 +324,18 @@ pub const Server = struct {
         }
     }
 
+    /// Host:port for this request's selfLink-style URLs: the request's
+    /// `Host` header when the client sent one, else the bind address the
+    /// server started with. A server started with `--host=0.0.0.0` would
+    /// otherwise hand out `http://0.0.0.0:9050/...`, an address that only
+    /// works on the emulator's own host.
+    fn requestEndpoint(
+        s: *Server,
+        req: *const http_server.Request,
+    ) []const u8 {
+        return req.headers.host orelse s.endpoint;
+    }
+
     fn route(
         s: *Server,
         req: *const http_server.Request,
@@ -844,7 +856,7 @@ pub const Server = struct {
 
         const table_spec = (try db.catalogTable(arena, project_id, dataset_id, table_id)) orelse
             return internalError(arena, "table was created but is not in the catalog");
-        return .{ .body = try server.tableResource(arena, table_spec) };
+        return .{ .body = try server.tableResource(arena, server.requestEndpoint(req), table_spec) };
     }
 
     fn handleTablesGet(
@@ -861,7 +873,7 @@ pub const Server = struct {
                 "table {s} is not found",
                 .{table_id},
             ));
-        return .{ .body = try s.tableResource(arena, table_spec) };
+        return .{ .body = try s.tableResource(arena, s.requestEndpoint(req), table_spec) };
     }
 
     /// The metadata API's resource for a catalog spec: what the client posted
@@ -874,10 +886,11 @@ pub const Server = struct {
     pub fn tableResource(
         s: *Server,
         arena: std.mem.Allocator,
+        endpoint: []const u8,
         table_spec: *const zigquery.spec.TableSpec,
     ) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
-        try tables_handler.writeTable(arena, &out, try s.tableMeta(arena, table_spec));
+        try tables_handler.writeTable(arena, &out, try s.tableMeta(arena, endpoint, table_spec));
         return out.items;
     }
 
@@ -1011,6 +1024,7 @@ pub const Server = struct {
     fn tableMeta(
         s: *Server,
         arena: std.mem.Allocator,
+        endpoint: []const u8,
         table_spec: *const zigquery.spec.TableSpec,
     ) !tables_handler.TableMeta {
         const path = table_spec.name_path;
@@ -1025,7 +1039,7 @@ pub const Server = struct {
             .project_id = path[0],
             .dataset_id = path[1],
             .table_id = path[2],
-            .endpoint = s.endpoint,
+            .endpoint = endpoint,
             .created_millis = created_millis,
             .schema = try schemaNode(arena, table_spec),
             .kind = if (table_spec.is_view) "VIEW" else "TABLE",
@@ -1082,7 +1096,7 @@ pub const Server = struct {
         };
         const updated = (try s.db.catalogTable(arena, project_id, dataset_id, table_id)) orelse
             return internalError(arena, "table vanished while being patched");
-        return .{ .body = try s.tableResource(arena, updated) };
+        return .{ .body = try s.tableResource(arena, s.requestEndpoint(req), updated) };
     }
 
     /// A tables request's 400 when the layout fields of `resource` name none of `columns`.
@@ -1137,7 +1151,7 @@ pub const Server = struct {
         try out.appendSlice(arena, "{\"tables\":[");
         for (specs, 0..) |table_spec, i| {
             if (i > 0) try out.append(arena, ',');
-            try tables_handler.writeTableListEntry(arena, &out, try s.tableMeta(arena, table_spec));
+            try tables_handler.writeTableListEntry(arena, &out, try s.tableMeta(arena, s.requestEndpoint(req), table_spec));
         }
         try out.appendSlice(arena, "],\"totalItems\":");
         try out.print(arena, "{d}", .{specs.len});
@@ -1290,7 +1304,7 @@ pub const Server = struct {
 
         return switch (jobConfigKind(job)) {
             .query => s.handleQueryJob(arena, req, project_id, job),
-            .copy => s.handleCopyConfig(arena, project_id, job),
+            .copy => s.handleCopyConfig(arena, project_id, s.requestEndpoint(req), job),
             .load => s.handleLoadConfig(arena, req, project_id, job),
             .extract => badRequest(arena, "configuration.extract is not supported"),
             .none => badRequest(
@@ -1317,6 +1331,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        endpoint: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
         const parsed = copy_handler.parse(arena, job) catch |err| switch (err) {
@@ -1324,7 +1339,7 @@ pub const Server = struct {
             else => return badRequest(arena, copy_handler.parseErrorMessage(err)),
         };
         const copy = parsed orelse return badRequest(arena, "configuration.copy is required");
-        return s.handleCopyJob(arena, project_id, copy);
+        return s.handleCopyJob(arena, project_id, endpoint, copy);
     }
 
     /// A load job posted to `/jobs` rather than to the upload endpoint, so it names its data
@@ -1375,7 +1390,7 @@ pub const Server = struct {
         const parts = upload.parseMultipart(req.body, boundary) catch {
             return badRequest(arena, "the upload body is not two multipart/related parts");
         };
-        return s.runLoadJob(arena, project_id, parts.metadata, parts.media);
+        return s.runLoadJob(arena, project_id, s.requestEndpoint(req), parts.metadata, parts.media);
     }
 
     /// The initiating request of a resumable upload. Answers with the session URI the bytes
@@ -1476,7 +1491,7 @@ pub const Server = struct {
 
         // 200 with the job resource, which is what the client accepts from a completed
         // resumable upload alongside the 308 it takes between chunks.
-        return s.runLoadJob(arena, project_id, metadata, media);
+        return s.runLoadJob(arena, project_id, s.requestEndpoint(req), metadata, media);
     }
 
     /// Reads `media` under the configuration in `metadata` and writes the rows it yields.
@@ -1487,6 +1502,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        endpoint: []const u8,
         metadata: []const u8,
         media: []const u8,
     ) !http_server.Response {
@@ -1518,7 +1534,7 @@ pub const Server = struct {
         // CREATE_NEVER reports a missing destination in the job result.
         // rest/v2/Job#jobconfigurationload
         if (existing == null and !spec.mayCreateDestination()) {
-            return s.storeLoadJob(arena, project_id, job_id, spec, unix_seconds, .{
+            return s.storeLoadJob(arena, project_id, endpoint, job_id, spec, unix_seconds, .{
                 .failed = .{
                     .reason = "notFound",
                     .message = try std.fmt.allocPrint(
@@ -1531,7 +1547,7 @@ pub const Server = struct {
         }
         if (existing != null and spec.refusesOccupiedDestination()) {
             if (try s.tableRowCount(arena, existing.?) > 0) {
-                return s.storeLoadJob(arena, project_id, job_id, spec, unix_seconds, .{
+                return s.storeLoadJob(arena, project_id, endpoint, job_id, spec, unix_seconds, .{
                     .failed = .{
                         .reason = "duplicate",
                         .message = try std.fmt.allocPrint(
@@ -1554,11 +1570,12 @@ pub const Server = struct {
                 server: *Server,
                 a: std.mem.Allocator,
                 p: []const u8,
+                ep: []const u8,
                 id: []const u8,
                 sp: load_handler.LoadSpec,
                 seconds: i64,
             ) !http_server.Response {
-                return server.storeLoadJob(a, p, id, sp, seconds, .{
+                return server.storeLoadJob(a, p, ep, id, sp, seconds, .{
                     .failed = .{
                         .reason = "invalid",
                         .message = "Error while reading data, error message: " ++
@@ -1569,7 +1586,7 @@ pub const Server = struct {
         }.response;
 
         if (read.bad_records > spec.max_bad_records) {
-            return tooManyBadRecords(s, arena, project_id, job_id, spec, unix_seconds);
+            return tooManyBadRecords(s, arena, project_id, endpoint, job_id, spec, unix_seconds);
         }
 
         // One transaction: a load that turns out to carry too many bad records leaves the
@@ -1598,13 +1615,13 @@ pub const Server = struct {
                     .{ dst.project_id, dst.dataset_id, dst.table_id },
                 ), &.{}, .{});
             }
-            return tooManyBadRecords(s, arena, project_id, job_id, spec, unix_seconds);
+            return tooManyBadRecords(s, arena, project_id, endpoint, job_id, spec, unix_seconds);
         }
 
         try s.db.rawExec("COMMIT", &.{});
         committed = true;
 
-        return s.storeLoadJob(arena, project_id, job_id, spec, unix_seconds, .{
+        return s.storeLoadJob(arena, project_id, endpoint, job_id, spec, unix_seconds, .{
             .loaded = .{
                 .input_file_bytes = media.len,
                 .output_rows = read.rowCount() - rejected,
@@ -1678,6 +1695,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        endpoint: []const u8,
         job_id: []const u8,
         spec: load_handler.LoadSpec,
         unix_seconds: i64,
@@ -1687,7 +1705,7 @@ pub const Server = struct {
         try load_handler.writeJobResource(arena, &resource, .{
             .project_id = project_id,
             .job_id = job_id,
-            .endpoint = s.endpoint,
+            .endpoint = endpoint,
             .unix_seconds = unix_seconds,
             .load = spec,
             .outcome = outcome,
@@ -1833,7 +1851,7 @@ pub const Server = struct {
             .project_id = project_id,
             .job_id = job_id,
             .sql = sql,
-            .endpoint = s.endpoint,
+            .endpoint = s.requestEndpoint(req),
             .total_bytes = res.total_bytes,
             .unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000),
             .outcome = res.set.?.outcome,
@@ -1980,6 +1998,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        endpoint: []const u8,
         copy: copy_handler.CopySpec,
     ) !http_server.Response {
         for (copy.sources) |src| {
@@ -2036,7 +2055,7 @@ pub const Server = struct {
         try copy_handler.writeJobResource(arena, &resource, .{
             .project_id = project_id,
             .job_id = job_id,
-            .endpoint = s.endpoint,
+            .endpoint = endpoint,
             .unix_seconds = unix_seconds,
             .copy = copy,
             .outcome = outcome,
@@ -2504,6 +2523,67 @@ test "jobs.insert binds a positional parameter" {
     ), "");
     try testing.expectEqual(std.http.Status.ok, got.status);
     try testing.expectEqualStrings("6", try onlyCell(arena, got.body));
+}
+
+test "jobs.insert selfLink uses the request Host header, not the bind address" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    // The issue's repro, verbatim: a client reaching the emulator as
+    // bigquery-emulator:9050 must not be handed http://0.0.0.0:9050/....
+    const req = http_server.Request{
+        .method = .POST,
+        .path = "/projects/test/jobs",
+        .body =
+        \\{"configuration":{"query":{"query":"SELECT 1 AS i","useLegacySql":false}}}
+        ,
+        .headers = .{ .host = "bigquery-emulator:9050" },
+        .arena = arena,
+    };
+    const res = try s.handler().func(s.handler().ctx, &req);
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        res.body,
+        "\"selfLink\":\"http://bigquery-emulator:9050/bigquery/v2/projects/test/jobs/",
+    ) != null);
+    // jobs.get serves the stored resource verbatim, so it carries the
+    // same Host-derived link even when the poll sends no Host header.
+    const job_id = try jobIdOf(arena, res.body);
+    const got = try request(s, arena, .GET, try std.fmt.allocPrint(
+        arena,
+        "/projects/test/jobs/{s}",
+        .{job_id},
+    ), "");
+    try testing.expectEqual(std.http.Status.ok, got.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        got.body,
+        "\"selfLink\":\"http://bigquery-emulator:9050/bigquery/v2/projects/test/jobs/",
+    ) != null);
+}
+
+test "jobs.insert selfLink falls back to the bind address without a Host header" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":"SELECT 1 AS i","useLegacySql":false}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        res.body,
+        "\"selfLink\":\"http://0.0.0.0:9050/bigquery/v2/projects/test/jobs/",
+    ) != null);
 }
 
 test "a parameterized query with a value missing still reports the arity error" {
