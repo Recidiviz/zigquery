@@ -446,26 +446,30 @@ const TableDataList = struct {
     rows: []const tablerow.TableRow,
 };
 
-/// Serializes the rows of a table that `page` selects as a tabledata.list response.
+/// One page of a table, read on its own rather than sliced out of the whole table.
+pub const TableWindow = struct {
+    /// The page's rows.
+    rows: ResultSet,
+    /// Rows in the whole table.
+    total: usize,
+    /// The table row the page starts at.
+    start: usize,
+};
+
+/// Serializes one page of a table's rows as a tabledata.list response.
 pub fn writeTableDataList(
     arena: std.mem.Allocator,
     out: *std.ArrayList(u8),
-    set: ResultSet,
-    page: Page,
+    window: TableWindow,
     use_int64_timestamp: bool,
 ) !void {
-    const render = try set.renderer(arena, use_int64_timestamp);
-    const window = page.range(set.total_rows);
-    const rows = try arena.alloc(tablerow.TableRow, window.next - window.first);
-    for (window.first..window.next) |row| {
-        rows[row - window.first] = .{ .cells = try render.row(row) };
-    }
+    const render = try window.rows.renderer(arena, use_int64_timestamp);
+    const rows = try arena.alloc(tablerow.TableRow, window.rows.total_rows);
+    for (rows, 0..) |*row, i| row.* = .{ .cells = try render.row(i) };
+    const next = window.start + window.rows.total_rows;
     const body = try std.json.Stringify.valueAlloc(arena, TableDataList{
-        .totalRows = try std.fmt.allocPrint(arena, "{d}", .{set.total_rows}),
-        .pageToken = if (window.next < set.total_rows)
-            try std.fmt.allocPrint(arena, "{d}", .{window.next})
-        else
-            null,
+        .totalRows = try std.fmt.allocPrint(arena, "{d}", .{window.total}),
+        .pageToken = if (next < window.total) try std.fmt.allocPrint(arena, "{d}", .{next}) else null,
         .rows = rows,
     }, response.envelope_options);
     try out.appendSlice(arena, body);
@@ -744,11 +748,12 @@ test "a tabledata.list page carries the total and a token for the rest" {
     const collected = try collectResultSet(
         arena,
         db,
-        "SELECT n FROM UNNEST([10, 20, 30]) AS n ORDER BY n",
+        "SELECT n FROM UNNEST([20, 30]) AS n ORDER BY n",
         &.{},
     );
     var out: std.ArrayList(u8) = .empty;
-    try writeTableDataList(arena, &out, collected.set.?, .{ .max_results = 2, .start = 1 }, false);
+    const window: TableWindow = .{ .rows = collected.set.?, .total = 3, .start = 1 };
+    try writeTableDataList(arena, &out, window, false);
     try testing.expectEqualStrings(
         \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"20"}]},{"f":[{"v":"30"}]}]}
     , out.items);

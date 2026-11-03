@@ -635,7 +635,7 @@ pub fn isSafeIdentifier(name: []const u8) bool {
     return true;
 }
 
-fn appendSelectList(
+pub fn appendSelectList(
     arena: std.mem.Allocator,
     out: *std.ArrayList(u8),
     selected_fields: []const []const u8,

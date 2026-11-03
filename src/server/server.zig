@@ -35,6 +35,7 @@ const jobs_handler = @import("handler/jobs.zig");
 const copy_handler = @import("handler/jobs.copy.zig");
 const pb = @import("proto/bigquery.zig");
 const upload = @import("upload.zig");
+const read_service = @import("grpc/read_service.zig");
 const load_handler = @import("handler/jobs.load.zig");
 const load_rows = @import("internal/load_rows.zig");
 const datasets_handler = @import("handler/datasets.zig");
@@ -1200,10 +1201,12 @@ pub const Server = struct {
         table_id: []const u8,
     ) !http_server.Response {
         const arena = req.arena;
-        if (!try s.db.datasetExists(arena, project_id, dataset_id)) {
-            return datasetNotFound(arena, project_id, dataset_id);
-        }
+        // A query's destination table lives in the anonymous dataset, which no one declares.
         if (try s.db.catalogTable(arena, project_id, dataset_id, table_id) == null) {
+            const anonymous = std.mem.eql(u8, dataset_id, job_rows_vtab.anon_segment);
+            if (!anonymous and !try s.db.datasetExists(arena, project_id, dataset_id)) {
+                return datasetNotFound(arena, project_id, dataset_id);
+            }
             return notFound(arena, try std.fmt.allocPrint(
                 arena,
                 "Not found: Table {s}:{s}.{s}",
@@ -1211,21 +1214,29 @@ pub const Server = struct {
             ));
         }
 
-        const columns = if (req.queryParam("selectedFields")) |encoded|
-            selectedColumns(arena, encoded) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                error.InvalidFieldName => return badRequest(arena, "invalid selectedFields"),
-            }
+        var select_list: std.ArrayList(u8) = .empty;
+        const fields = if (req.queryParam("selectedFields")) |encoded|
+            try selectedFields(arena, encoded)
         else
-            "*";
-        const sql = try std.fmt.allocPrint(
+            &.{};
+        read_service.appendSelectList(arena, &select_list, fields) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.MalformedFieldName => return badRequest(arena, "invalid selectedFields"),
+        };
+        const table = try std.fmt.allocPrint(
             arena,
-            "SELECT {s} FROM `{s}.{s}.{s}`",
-            .{ columns, project_id, dataset_id, table_id },
+            "`{s}.{s}.{s}`",
+            .{ project_id, dataset_id, table_id },
         );
-        const collected = try query_handler.collectResultSet(arena, s.db, sql, &.{});
-        const set = collected.set orelse
-            return .{ .status = collected.status, .body = collected.body };
+
+        const counted = try query_handler.collectResultSet(
+            arena,
+            s.db,
+            try std.fmt.allocPrint(arena, "SELECT COUNT(*) FROM {s}", .{table}),
+            &.{},
+        );
+        const count = counted.set orelse
+            return .{ .status = counted.status, .body = counted.body };
 
         // startIndex applies when no pageToken resumes a read.
         var page = query_handler.parseResultsPage(arena, req.query);
@@ -1234,15 +1245,25 @@ pub const Server = struct {
                 page.start = std.fmt.parseInt(usize, text, 10) catch 0;
             }
         }
+        const take: i64 = if (page.max_results < 0) std.math.maxInt(i64) else page.max_results;
+        const read = try query_handler.collectResultSet(
+            arena,
+            s.db,
+            try std.fmt.allocPrint(
+                arena,
+                "SELECT {s} FROM {s} LIMIT {d} OFFSET {d}",
+                .{ select_list.items, table, take, page.start },
+            ),
+            &.{},
+        );
+        const rows = read.set orelse return .{ .status = read.status, .body = read.body };
 
         var out: std.ArrayList(u8) = .empty;
-        try query_handler.writeTableDataList(
-            arena,
-            &out,
-            set,
-            page,
-            query_handler.int64TimestampFromQuery(arena, req.query),
-        );
+        try query_handler.writeTableDataList(arena, &out, .{
+            .rows = rows,
+            .total = @intCast(count.cells[0].int),
+            .start = page.start,
+        }, query_handler.int64TimestampFromQuery(arena, req.query));
         return .{ .body = out.items };
     }
 
@@ -2440,24 +2461,13 @@ pub const Server = struct {
     }
 };
 
-/// The SELECT list for tabledata.list's selectedFields: comma-separated top-level column
-/// names, percent-encoded on the wire.
-fn selectedColumns(
-    arena: std.mem.Allocator,
-    encoded: []const u8,
-) error{ OutOfMemory, InvalidFieldName }![]const u8 {
+/// tabledata.list's selectedFields: comma-separated top-level column names, percent-encoded
+/// on the wire. An empty name stays in, for the select list to refuse.
+fn selectedFields(arena: std.mem.Allocator, encoded: []const u8) ![]const []const u8 {
     const decoded = std.Uri.percentDecodeInPlace(try arena.dupe(u8, encoded));
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayList([]const u8) = .empty;
     var names = std.mem.splitScalar(u8, decoded, ',');
-    while (names.next()) |raw| {
-        const name = std.mem.trim(u8, raw, " ");
-        if (name.len == 0) return error.InvalidFieldName;
-        for (name) |c| {
-            if (!std.ascii.isAlphanumeric(c) and c != '_') return error.InvalidFieldName;
-        }
-        if (out.items.len != 0) try out.appendSlice(arena, ", ");
-        try out.print(arena, "`{s}`", .{name});
-    }
+    while (names.next()) |raw| try out.append(arena, std.mem.trim(u8, raw, " "));
     return out.items;
 }
 
@@ -3877,6 +3887,46 @@ test "tabledata.list pages a table's rows" {
     try testing.expectEqualStrings(
         \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"25"}]},{"f":[{"v":"41"}]}]}
     , selected.body);
+}
+
+test "tabledata.list reads a query's destination table" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+    const insert = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":
+        \\"SELECT n FROM UNNEST([4, 5, 6]) AS n ORDER BY n","useLegacySql":false}}}
+    );
+    const path = try std.fmt.allocPrint(
+        arena,
+        "/projects/test/datasets/_anon/tables/{s}/data",
+        .{try destinationOf(arena, insert.body)},
+    );
+
+    const res = try requestQuery(s, arena, .GET, path, "maxResults=1&pageToken=1", "");
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","pageToken":"2","rows":[{"f":[{"v":"5"}]}]}
+    , res.body);
+}
+
+test "tabledata.list refuses a selected field that is not a column name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try createStreamTable(s, arena, "streamed");
+
+    const path = "/projects/test/datasets/ds1/tables/streamed/data";
+    for ([_][]const u8{ "selectedFields=1age", "selectedFields=age%2C", "selectedFields=a%60b" }) |q| {
+        const res = try requestQuery(s, arena, .GET, path, q, "");
+        try testing.expectEqual(std.http.Status.bad_request, res.status);
+    }
 }
 
 test "tabledata.list on a missing table is a 404" {
