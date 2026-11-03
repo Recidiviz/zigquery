@@ -140,7 +140,7 @@ test "temporal kinds keep their own units" {
 
 test "decimals are minimal-length big-endian two's complement" {
     // Neither stored form is reusable: codec_binary is little-endian at a fixed
-    // width, codec_sortable is big-endian but sign-bit-XORed for memcmp.
+    // width, codec_sortable is a length-prefixed magnitude at scale 38.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();

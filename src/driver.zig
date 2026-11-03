@@ -462,38 +462,8 @@ pub const Db = struct {
         return db.last_error_param;
     }
 
-    /// The storage format this build reads and writes, kept in the database's
-    /// `user_version`.
-    ///
-    /// 5 — the current format, and the only one this build reads or writes: as
-    ///     4, but every view's catalog entry records the tables and views its
-    ///     query reads (`TableSpec.dependencies`), which a refresh relies on to
-    ///     know when the view is out of date.
-    /// 4 — the self-delimiting codec stores DATE, DATETIME, TIME and
-    ///     NUMERIC/BIGNUMERIC as fixed-width little-endian integers rather than
-    ///     as their rendered text (codec_binary.zig).
-    /// 3 — every non-scalar value is a BLOB carrying one of the two payload
-    ///     shapes (codec_sortable.zig for the orderable kinds, codec_binary.zig
-    ///     for the rest).
-    /// 2 — orderable kinds as BLOB, NUMERIC/BIGNUMERIC still base64 in TEXT.
-    /// 1 — every value as base64 in TEXT.
-    ///
-    /// None of 1-4 is readable here and there is no migration: the code that
-    /// decoded 1-3 is gone, and a version 4 catalog holds views whose dependencies
-    /// were never recorded. They are listed because refusing a database is only
-    /// useful if the reader can tell what was refused.
-    ///
-    /// 3 is the one that would fail quietly rather than loudly if it were not
-    /// refused: its tags are these tags, so a stored DATE would read its
-    /// "1970-01-01" as an 8-byte integer and come back as some far-future day
-    /// rather than as an error.
-    ///
-    /// Refusing is the only defence available, because a mismatch fails
-    /// silently rather than loudly: TEXT and BLOB never compare equal in SQLite,
-    /// so a database holding the older shape would not error — it would quietly
-    /// stop deduplicating in DISTINCT and UNION, and stop matching in index
-    /// lookups.
-    pub const storage_format_version: i64 = 5;
+    /// The storage format this build reads and writes, kept in the database's `user_version`.
+    pub const storage_format_version: i64 = 6;
 
     /// Refuses a database this build cannot read, and reports whether it is new and so needs
     /// `stampStorageFormat`. Reads only.

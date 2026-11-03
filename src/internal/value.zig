@@ -2480,7 +2480,17 @@ const Appender = struct {
 // ----------------------------------------------------------------------
 
 pub fn compareForCollation(a: Value, b: Value) ValueError!std.math.Order {
-    if (a.eq(b) catch false) return .eq;
+    if (a.eq(b) catch false) {
+        // Equal NUMERIC and BIGNUMERIC values: NUMERIC first, as the shared
+        // encoding's trailing kind byte orders them.
+        if (a == .numeric and b == .numeric) {
+            return std.math.order(
+                @intFromBool(a.numeric.is_bignumeric),
+                @intFromBool(b.numeric.is_bignumeric),
+            );
+        }
+        return .eq;
+    }
     if (a.gt(b) catch false) return .gt;
     return .lt;
 }

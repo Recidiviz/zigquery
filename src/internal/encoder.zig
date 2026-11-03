@@ -661,7 +661,7 @@ test "EncodeValue splits non-scalar kinds by storage format" {
     const num_repr = try EncodeValue(alloc, num);
     try testing.expect(num_repr == .blob);
     try testing.expectEqual(@as(u8, 0x70), num_repr.blob[0]);
-    try testing.expectEqual(@as(usize, 17), num_repr.blob.len);
+    try testing.expectEqual(@as(usize, 19), num_repr.blob.len);
 }
 
 test "encodeTo reuses its scratch buffer instead of allocating per value" {

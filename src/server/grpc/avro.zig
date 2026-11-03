@@ -178,8 +178,8 @@ pub const Writer = struct {
 /// Avro `decimal` wants.
 ///
 /// Neither stored form is reusable: `codec_binary` writes two's complement
-/// little-endian at a fixed 16/32 bytes, and `codec_sortable` writes big-endian
-/// but sign-bit-XORed so that memcmp orders correctly.
+/// little-endian at a fixed 16/32 bytes, and `codec_sortable` writes a magnitude
+/// at scale 38 under a sign-and-length header so that memcmp orders correctly.
 ///
 /// "Minimal length" means the leading byte is dropped while it is pure sign
 /// extension of the next one — 0x00 followed by a clear top bit, or 0xff

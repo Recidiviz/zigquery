@@ -63,9 +63,8 @@ const range_flag_end: u8 = 1 << 1;
 
 /// Payload widths for the two decimal kinds: the unscaled integer, two's
 /// complement little-endian, at the width its scale needs. NUMERIC's 38 digits
-/// need 127 bits and BIGNUMERIC's 76 need 255 — the same widths
-/// codec_sortable.zig uses, minus the bias it needs and this does not, since
-/// nothing compares these bytes.
+/// need 127 bits and BIGNUMERIC's 76 need 255. Nothing orders these bytes, so
+/// unlike codec_sortable.zig they carry no order-preserving transform.
 ///
 /// Fixed rather than minimal-length: it makes both directions a memcpy, and a
 /// length prefix would cost a byte of its own on most values anyway. The

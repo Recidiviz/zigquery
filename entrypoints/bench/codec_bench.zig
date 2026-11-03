@@ -136,7 +136,19 @@ pub fn main(init: std.process.Init) !void {
     try sql.print(gpa, "{d}", .{rows});
     try sql.appendSlice(gpa, ")) AS x");
 
-    var stages: [9]Stage = undefined;
+    // NUMERIC and BIGNUMERIC in a table of their own, so the stages above keep
+    // their row shape. Division by 7 fills every fractional digit of the scale.
+    try db.exec("CREATE TABLE tn (num NUMERIC, big BIGNUMERIC)", &.{}, .{});
+    var nsql: std.ArrayList(u8) = .empty;
+    defer nsql.deinit(gpa);
+    try nsql.print(
+        gpa,
+        "INSERT INTO tn (num, big) SELECT CAST(x AS NUMERIC) / 7, CAST(x AS BIGNUMERIC) / 7 " ++
+            "FROM UNNEST(GENERATE_ARRAY(1, {d})) AS x",
+        .{rows},
+    );
+
+    var stages: [12]Stage = undefined;
     var ns: usize = 0;
 
     var stage = try begin(&counting);
@@ -258,6 +270,31 @@ pub fn main(init: std.process.Init) !void {
         while (try r.next()) |_| {}
     }
     stages[ns] = end(stage, "ARRAY_AGG(... ORDER BY)", rows, &counting);
+    ns += 1;
+
+    stage = try begin(&counting);
+    try db.exec(nsql.items, &.{}, .{});
+    stages[ns] = end(stage, "INSERT numerics", rows, &counting);
+    ns += 1;
+
+    stage = try begin(&counting);
+    n = 0;
+    {
+        var r = try db.query("SELECT num, big FROM tn", &.{}, .{});
+        defer r.deinit();
+        while (try r.next()) |_| n += 1;
+    }
+    stages[ns] = end(stage, "SELECT numerics", n, &counting);
+    ns += 1;
+
+    stage = try begin(&counting);
+    n = 0;
+    {
+        var r = try db.query("SELECT num FROM tn ORDER BY num", &.{}, .{});
+        defer r.deinit();
+        while (try r.next()) |_| n += 1;
+    }
+    stages[ns] = end(stage, "ORDER BY numeric", n, &counting);
     ns += 1;
 
     // The control stage does no real codec work — every value in it is a native

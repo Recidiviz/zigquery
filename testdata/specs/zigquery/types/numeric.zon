@@ -1,0 +1,340 @@
+.{
+    .spec = "zigquery/types/numeric",
+    .dialect = .zigquery,
+    .typed = true,
+    // NUMERIC and BIGNUMERIC against each other and against INT64 and FLOAT64. Operands are CTE
+    // columns rather than literals unless a case says otherwise, so literal coercion cannot pick
+    // the comparison type. Every expectation measured (recidiviz-bigquery-sandbox, 2026-10-30).
+    .cases = .{
+        // INT64 against NUMERIC compares as NUMERIC: exact, with no rounding through FLOAT64.
+        .{
+            .desc = "int64 vs numeric and bignumeric",
+            .sql =
+            \\WITH t AS (SELECT 1 AS i, NUMERIC '1' AS n1, NUMERIC '1.5' AS n15, BIGNUMERIC '1' AS b1,
+            \\  BIGNUMERIC '0.99999999999999999999999999999999999999' AS bnear)
+            \\SELECT i = n1 AS eq_n, i < n15 AS lt_n, i = b1 AS eq_b, i > bnear AS gt_bnear,
+            \\  n15 > i AS gt_rev FROM t
+            ,
+            .rows = .{
+                .{ true, true, true, true, true },
+            },
+        },
+        // Half a unit and one BIGNUMERIC ulp from INT64's extremes; as FLOAT64 both would be equal.
+        .{
+            .desc = "int64 extremes vs numeric",
+            .sql =
+            \\WITH t AS (SELECT 9223372036854775807 AS imax, -9223372036854775808 AS imin,
+            \\  NUMERIC '9223372036854775807' AS nmax, NUMERIC '9223372036854775806.5' AS nbelow,
+            \\  BIGNUMERIC '9223372036854775807.00000000000000000000000000000000000001' AS babove)
+            \\SELECT imax = nmax AS eq, imax > nbelow AS gt_half, imax < babove AS lt_ulp,
+            \\  imin < nbelow AS lt_min FROM t
+            ,
+            .rows = .{
+                .{ true, true, true, true },
+            },
+        },
+        // 2^53 + 1 is not a double; compared exactly it is greater than 2^53.
+        .{
+            .desc = "int64 past float precision vs numeric",
+            .sql =
+            \\WITH t AS (SELECT 9007199254740993 AS i, NUMERIC '9007199254740992' AS n)
+            \\SELECT i = n AS eq, i > n AS gt FROM t
+            ,
+            .rows = .{
+                .{ false, true },
+            },
+        },
+        // FLOAT64 against NUMERIC or BIGNUMERIC compares as FLOAT64: the decimal converts to the
+        // nearest double, so NUMERIC '0.1' and BIGNUMERIC '0.1' both equal FLOAT64 0.1, and 0.3 is
+        // below 0.1 + 0.2.
+        .{
+            .desc = "float64 vs numeric, inexact decimals",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '0.1' AS n01, 0.1 AS f01, NUMERIC '0.3' AS n03,
+            \\  0.1 + 0.2 AS f03, BIGNUMERIC '0.1' AS b01)
+            \\SELECT n01 = f01 AS eq01, n03 = f03 AS eq03, n03 < f03 AS lt03, b01 = f01 AS beq01 FROM t
+            ,
+            .rows = .{
+                .{ true, false, true, true },
+            },
+        },
+        // Each FLOAT64 here is the double nearest its decimal.
+        .{
+            .desc = "float64 vs numeric, more digits than a double",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '123456789.123456789' AS n, 123456789.12345679 AS f,
+            \\  NUMERIC '0.000000001' AS ntiny, 1e-9 AS ftiny,
+            \\  BIGNUMERIC '0.12345678901234567890123456789012345678' AS b, 0.12345678901234568 AS fb)
+            \\SELECT n = f AS eq, n < f AS lt, ntiny = ftiny AS eq_tiny, b = fb AS beq FROM t
+            ,
+            .rows = .{
+                .{ true, false, true, true },
+            },
+        },
+        // NaN compares false under every operator, and -0.0 equals NUMERIC 0.
+        .{
+            .desc = "float64 specials vs numeric",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '1' AS n, CAST('nan' AS FLOAT64) AS nan,
+            \\  CAST('inf' AS FLOAT64) AS inf, CAST('-inf' AS FLOAT64) AS ninf, -0.0 AS nz,
+            \\  NUMERIC '0' AS n0)
+            \\SELECT n = nan AS eq_nan, n < nan AS lt_nan, n > nan AS gt_nan, n < inf AS lt_inf,
+            \\  n > ninf AS gt_ninf, n0 = nz AS eq_negzero FROM t
+            ,
+            .rows = .{
+                .{ false, false, false, true, true, true },
+            },
+        },
+        // NUMERIC's maximum rounds to the double 1e29. BIGNUMERIC's maximum rounds to
+        // 5.7896044618658096e38, a different double from 5.78960446186581e38.
+        .{
+            .desc = "float64 extremes vs numeric maxima",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '99999999999999999999999999999.999999999' AS nmax, 1e29 AS f29,
+            \\  BIGNUMERIC '578960446186580977117854925043439539266.34992332820282019728792003956564819967' AS bmax,
+            \\  1e300 AS fbig, 5.78960446186581e38 AS fbmax)
+            \\SELECT nmax = f29 AS eq29, nmax < f29 AS lt29, bmax < fbig AS lt_big, bmax = fbmax AS eq_bmax FROM t
+            ,
+            .rows = .{
+                .{ true, false, true, false },
+            },
+        },
+        .{
+            .desc = "literal operands",
+            .sql =
+            \\SELECT NUMERIC '0.1' = 0.1 AS a, NUMERIC '1.5' = 1 AS b, NUMERIC '1.5' > 1 AS c,
+            \\  BIGNUMERIC '0.1' = 0.1 AS d, NUMERIC '0.3' = 0.30000000000000004 AS e
+            ,
+            .rows = .{
+                .{ true, false, true, true, true },
+            },
+        },
+        .{
+            .desc = "IN lists mixing kinds",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '2.5' AS n, 1 AS i, 2.5 AS f)
+            \\SELECT n IN (i, f) AS cols, n IN (1, 2.5) AS lits, NUMERIC '1' IN (i) AS int_only FROM t
+            ,
+            .rows = .{
+                .{ true, true, true },
+            },
+        },
+        .{
+            .desc = "BETWEEN mixing kinds",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '1.5' AS n, 1 AS lo, 2.0 AS hi)
+            \\SELECT n BETWEEN lo AND hi AS a, lo BETWEEN NUMERIC '0.5' AND BIGNUMERIC '1' AS b FROM t
+            ,
+            .rows = .{
+                .{ true, true },
+            },
+        },
+        .{
+            .desc = "IS DISTINCT FROM mixing kinds",
+            .sql =
+            \\WITH t AS (SELECT 1 AS i, NUMERIC '1' AS n, 1.0 AS f, BIGNUMERIC '1' AS b)
+            \\SELECT i IS DISTINCT FROM n AS a, n IS NOT DISTINCT FROM f AS c,
+            \\  n IS DISTINCT FROM b AS d FROM t
+            ,
+            .rows = .{
+                .{ false, true, false },
+            },
+        },
+        // Result types: NUMERIC, FLOAT64, BIGNUMERIC, NUMERIC, NUMERIC.
+        .{
+            .desc = "GREATEST LEAST IF COALESCE mixing kinds",
+            .sql =
+            \\WITH t AS (SELECT 1 AS i, NUMERIC '1.5' AS n, 1.25 AS f, BIGNUMERIC '1.4' AS b)
+            \\SELECT GREATEST(i, n) AS g_in, LEAST(n, f) AS l_nf, GREATEST(n, b) AS g_nb,
+            \\  IF(i > 0, i, n) AS if_in, COALESCE(NULL, i, n) AS co_in FROM t
+            ,
+            .rows = .{
+                .{ "1.5", 1.25, "1.5", "1", "1" },
+            },
+        },
+        // The union's column is BIGNUMERIC, so NUMERIC and BIGNUMERIC values interleave by value.
+        .{
+            .desc = "UNION ALL int numeric bignumeric ordered",
+            .sql =
+            \\SELECT x FROM (SELECT NUMERIC '1.5' AS x UNION ALL SELECT 2 UNION ALL SELECT BIGNUMERIC '1.25'
+            \\  UNION ALL SELECT -1 UNION ALL SELECT NUMERIC '-0.000000001'
+            \\  UNION ALL SELECT BIGNUMERIC '-0.00000000000000000000000000000000000001') ORDER BY x
+            ,
+            .rows = .{
+                .{"-1"},
+                .{"-0.000000001"},
+                .{"-0.00000000000000000000000000000000000001"},
+                .{"1.25"},
+                .{"1.5"},
+                .{"2"},
+            },
+        },
+        // The union's column is FLOAT64. NaN sorts first, below -inf.
+        .{
+            .desc = "UNION ALL numeric and float ordered",
+            .sql =
+            \\SELECT x FROM (SELECT NUMERIC '0.3' AS x UNION ALL SELECT 0.1 + 0.2 UNION ALL SELECT 0.25
+            \\  UNION ALL SELECT CAST('nan' AS FLOAT64) UNION ALL SELECT CAST('-inf' AS FLOAT64)) ORDER BY x
+            ,
+            .rows = .{
+                .{nan},
+                .{-inf},
+                .{0.25},
+                .{0.3},
+                .{0.30000000000000004},
+            },
+        },
+        .{
+            .desc = "DISTINCT and GROUP BY across int numeric bignumeric",
+            .sql =
+            \\SELECT x, COUNT(*) AS c FROM (SELECT 1 AS x UNION ALL SELECT NUMERIC '1'
+            \\  UNION ALL SELECT BIGNUMERIC '1.0' UNION ALL SELECT NUMERIC '1.5'
+            \\  UNION ALL SELECT BIGNUMERIC '1.50') GROUP BY x ORDER BY x
+            ,
+            .rows = .{
+                .{ "1", 3 },
+                .{ "1.5", 2 },
+            },
+        },
+        .{
+            .desc = "COUNT DISTINCT across numeric bignumeric float",
+            .sql =
+            \\SELECT COUNT(DISTINCT x) AS nb, (SELECT COUNT(DISTINCT y) FROM (SELECT NUMERIC '1.5' AS y
+            \\  UNION ALL SELECT BIGNUMERIC '1.5' UNION ALL SELECT 1.5)) AS nbf
+            \\FROM (SELECT NUMERIC '1.5' AS x UNION ALL SELECT BIGNUMERIC '1.5')
+            ,
+            .rows = .{
+                .{ 1, 1 },
+            },
+        },
+        .{
+            .desc = "MIN MAX across int numeric bignumeric",
+            .sql =
+            \\SELECT MIN(x) AS mn, MAX(x) AS mx FROM (SELECT NUMERIC '1.5' AS x UNION ALL SELECT 2
+            \\  UNION ALL SELECT BIGNUMERIC '-0.5')
+            ,
+            .rows = .{
+                .{ "-0.5", "2" },
+            },
+        },
+        .{
+            .desc = "JOIN int64 to numeric",
+            .sql =
+            \\WITH a AS (SELECT 1 AS k UNION ALL SELECT 2),
+            \\  b AS (SELECT NUMERIC '1' AS k UNION ALL SELECT NUMERIC '2.5')
+            \\SELECT a.k FROM a JOIN b ON a.k = b.k ORDER BY a.k
+            ,
+            .rows = .{
+                .{1},
+            },
+        },
+        .{
+            .desc = "JOIN float64 to numeric",
+            .sql =
+            \\WITH a AS (SELECT 0.5 AS k UNION ALL SELECT 0.1),
+            \\  b AS (SELECT NUMERIC '0.5' AS k UNION ALL SELECT NUMERIC '0.1')
+            \\SELECT a.k FROM a JOIN b ON a.k = b.k ORDER BY a.k
+            ,
+            .rows = .{
+                .{0.1},
+                .{0.5},
+            },
+        },
+        .{
+            .desc = "JOIN numeric to bignumeric",
+            .sql =
+            \\WITH a AS (SELECT NUMERIC '1.5' AS k UNION ALL SELECT NUMERIC '2'),
+            \\  b AS (SELECT BIGNUMERIC '1.5' AS k
+            \\    UNION ALL SELECT BIGNUMERIC '2.00000000000000000000000000000000000001')
+            \\SELECT a.k FROM a JOIN b ON a.k = b.k ORDER BY a.k
+            ,
+            .rows = .{
+                .{"1.5"},
+            },
+        },
+        // USING keeps the left side's type: INT64.
+        .{
+            .desc = "JOIN USING int64 and numeric",
+            .sql =
+            \\WITH a AS (SELECT 1 AS k), b AS (SELECT NUMERIC '1' AS k)
+            \\SELECT k FROM a JOIN b USING (k)
+            ,
+            .rows = .{
+                .{1},
+            },
+        },
+        // The INT64 offset applies to the NUMERIC order key: 1 PRECEDING from 1.6 reaches 0.6.
+        .{
+            .desc = "RANGE frame over numeric with int offset",
+            .sql =
+            \\SELECT n, COUNT(*) OVER (ORDER BY n RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS c
+            \\FROM UNNEST([NUMERIC '0.5', NUMERIC '1', NUMERIC '1.6', NUMERIC '2.5']) AS n ORDER BY n
+            ,
+            .rows = .{
+                .{ "0.5", 1 },
+                .{ "1", 2 },
+                .{ "1.6", 2 },
+                .{ "2.5", 2 },
+            },
+        },
+        .{
+            .desc = "RANGE frame over bignumeric with numeric offset",
+            .sql =
+            \\SELECT n, COUNT(*) OVER (ORDER BY n RANGE BETWEEN NUMERIC '0.5' PRECEDING AND CURRENT ROW) AS c
+            \\FROM UNNEST([BIGNUMERIC '0.5', BIGNUMERIC '1',
+            \\  BIGNUMERIC '1.00000000000000000000000000000000000001']) AS n ORDER BY n
+            ,
+            .rows = .{
+                .{ "0.5", 1 },
+                .{ "1", 2 },
+                .{ "1.00000000000000000000000000000000000001", 2 },
+            },
+        },
+        // The array's element type is BIGNUMERIC.
+        .{
+            .desc = "array literal mixing kinds",
+            .sql = "SELECT x FROM UNNEST([NUMERIC '1.5', BIGNUMERIC '1.25', 1]) AS x ORDER BY x",
+            .rows = .{
+                .{"1"},
+                .{"1.25"},
+                .{"1.5"},
+            },
+        },
+        // 198207565.11698252 is the double nearest NUMERIC '198207565.116982509'; the double one ulp
+        // below it, 198207565.1169825, is not equal.
+        .{
+            .desc = "NUMERIC to FLOAT64 rounds to nearest",
+            .sql =
+            \\WITH t AS (SELECT NUMERIC '198207565.116982509' AS n, 198207565.11698252 AS nearest,
+            \\  198207565.1169825 AS one_ulp_low)
+            \\SELECT n = nearest AS eq_nearest, n = one_ulp_low AS eq_low FROM t
+            ,
+            .rows = .{
+                .{ true, false },
+            },
+        },
+        .{
+            .desc = "BIGNUMERIC literal to FLOAT64",
+            .sql =
+            \\SELECT CAST(CAST(BIGNUMERIC '0.1' AS FLOAT64) AS STRING) AS a,
+            \\  CAST(CAST(BIGNUMERIC '0.2' AS FLOAT64) AS STRING) AS b,
+            \\  CAST(CAST(BIGNUMERIC '0.3' AS FLOAT64) AS STRING) AS c,
+            \\  CAST(BIGNUMERIC '0.3' AS FLOAT64) = 0.3 AS c_eq
+            ,
+            .rows = .{
+                .{ "0.1", "0.2", "0.3", true },
+            },
+        },
+        // 1e-10 is below NUMERIC's scale and rounds to 0.
+        .{
+            .desc = "FLOAT64 to NUMERIC and BIGNUMERIC",
+            .sql =
+            \\SELECT CAST(CAST(0.1 AS NUMERIC) AS STRING) AS n, CAST(CAST(0.1 AS BIGNUMERIC) AS STRING) AS b,
+            \\  CAST(CAST(1e-10 AS NUMERIC) AS STRING) AS tiny
+            ,
+            .rows = .{
+                .{ "0.1", "0.1", "0" },
+            },
+        },
+    },
+}
