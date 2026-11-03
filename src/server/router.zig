@@ -99,11 +99,6 @@ pub const routes = [_]Route{
         .pattern = "/resumable/upload/bigquery/v2/projects/*/jobs",
     },
 
-    .{ .id = .datasets_insert, .method = .POST, .pattern = "/projects/*/datasets" },
-    .{ .id = .datasets_list, .method = .GET, .pattern = "/projects/*/datasets" },
-    .{ .id = .datasets_get, .method = .GET, .pattern = "/projects/*/datasets/*" },
-    .{ .id = .datasets_delete, .method = .DELETE, .pattern = "/projects/*/datasets/*" },
-    .{ .id = .datasets_patch, .method = .PATCH, .pattern = "/projects/*/datasets/*" },
 
     .{ .id = .tables_insert, .method = .POST, .pattern = "/projects/*/datasets/*/tables" },
     .{ .id = .tables_list, .method = .GET, .pattern = "/projects/*/datasets/*/tables" },

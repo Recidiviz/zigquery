@@ -364,7 +364,14 @@ pub const Server = struct {
     ) !http_server.Response {
         return switch (m.route) {
             // routes.zig matches these before a request reaches router.zig.
-            .discovery, .debug_stats => unreachable,
+            .discovery,
+            .debug_stats,
+            .datasets_insert,
+            .datasets_list,
+            .datasets_get,
+            .datasets_delete,
+            .datasets_patch,
+            => unreachable,
             .jobs_query => s.handleQuery(req, m.captures.get(0)),
             .jobs_get_query_results => s.handleGetQueryResults(
                 req,
@@ -384,12 +391,6 @@ pub const Server = struct {
                     "unsupported in this milestone: jobs.list",
                 ),
             },
-
-            .datasets_insert => s.handleDatasetsInsert(req, m.captures.get(0)),
-            .datasets_list => s.handleDatasetsList(req, m.captures.get(0)),
-            .datasets_get => s.handleDatasetsGet(req, m.captures.get(0), m.captures.get(1)),
-            .datasets_delete => s.handleDatasetsDelete(req, m.captures.get(0), m.captures.get(1)),
-            .datasets_patch => s.handleDatasetsPatch(req, m.captures.get(0), m.captures.get(1)),
 
             .tables_insert => s.handleTablesInsert(req, m.captures.get(0), m.captures.get(1)),
             .tables_list => s.handleTablesList(req, m.captures.get(0), m.captures.get(1)),
@@ -636,7 +637,7 @@ pub const Server = struct {
 
     // ---- datasets ----
 
-    fn handleDatasetsInsert(
+    pub fn handleDatasetsInsert(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -672,7 +673,7 @@ pub const Server = struct {
         return .{ .body = resource.items };
     }
 
-    fn handleDatasetsList(
+    pub fn handleDatasetsList(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -706,7 +707,7 @@ pub const Server = struct {
         return out.items;
     }
 
-    fn handleDatasetsGet(
+    pub fn handleDatasetsGet(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -722,7 +723,7 @@ pub const Server = struct {
     /// the patch names is replaced whole and the rest are kept
     /// (https://cloud.google.com/bigquery/docs/reference/rest/v2/datasets/patch). The reference
     /// stays the request path's. datasets.get and datasets.list report the result.
-    fn handleDatasetsPatch(
+    pub fn handleDatasetsPatch(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -757,7 +758,7 @@ pub const Server = struct {
         return .{ .body = resource.items };
     }
 
-    fn handleDatasetsDelete(
+    pub fn handleDatasetsDelete(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,

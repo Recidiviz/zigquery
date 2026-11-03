@@ -34,6 +34,11 @@ pub const table = [_]Entry{
     route(.GET, "/$discovery/rest", .discovery, Server.handleDiscovery),
     // Not part of the BigQuery API: per-route timing for this process.
     route(.GET, "/debug/stats", .debug_stats, Server.handleDebugStats),
+    route(.POST, "/projects/:project/datasets", .datasets_insert, Server.handleDatasetsInsert),
+    route(.GET, "/projects/:project/datasets", .datasets_list, Server.handleDatasetsList),
+    route(.GET, "/projects/:project/datasets/:dataset", .datasets_get, Server.handleDatasetsGet),
+    route(.DELETE, "/projects/:project/datasets/:dataset", .datasets_delete, Server.handleDatasetsDelete),
+    route(.PATCH, "/projects/:project/datasets/:dataset", .datasets_patch, Server.handleDatasetsPatch),
 };
 
 /// Every entry of `table` under each prefix it is registered at, path included.
