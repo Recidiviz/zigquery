@@ -1,6 +1,6 @@
 //! The server. BigQuery's REST and Storage Read APIs over the zigquery engine.
 //!
-//! A request is routed (router.zig), decoded into the BigQuery's wire types (internal/types),
+//! A request is routed (routes.zig), decoded into the BigQuery's wire types (internal/types),
 //! turned into SQL run through the engine's driver, and encoded back as the API's JSON or,
 //! for the Storage Read API, as Arrow or Avro batches (grpc/).
 //!
@@ -9,7 +9,6 @@
 //! Server tests run under `zig build test-server`.
 
 pub const http_server = @import("http/server.zig");
-pub const router = @import("router.zig");
 pub const routes = @import("routes.zig");
 pub const errors = @import("error.zig");
 pub const json_pb = @import("json_pb.zig");

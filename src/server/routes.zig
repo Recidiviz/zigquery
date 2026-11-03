@@ -1,18 +1,46 @@
-//! The REST routes dusty matches, and the adapter that hands each match to a Server handler.
+//! The REST routes, replacing bigquery-emulator's gorilla/mux table (server.go).
 //!
-//! Every route is registered twice, at `/` and under `/bigquery/v2`, as the Go emulator did
-//! (server.go). A handler keeps the shape `fn (s, req, ids...) !http_server.Response`: `bind`
-//! passes the pattern's named params to it in pattern order and records its timing under the
-//! route's id for /debug/stats.
+//! Every route is registered twice, at `/` and under `/bigquery/v2`, as Go does
+//! (server.go:92-97). A handler keeps the shape `fn (s, req, ids...) !http_server.Response`:
+//! `bind` passes the pattern's named params to it in pattern order and times it under the
+//! route's Id for /debug/stats. A request no route matches gets `Server.unexpectedPath`.
 //!
-//! A request no route here matches falls through to `App.notFound`, which answers through
-//! router.zig.
+//! Param names are this table's own, one spelling per id. The discovery document spells the
+//! same path variable two ways (`{projectId}` and `{projectsId}`; handler_gen.go:14 and :79),
+//! which is why Go carries six `xIDFromParams` helpers that try both
+//! (server/middleware.go:115-167).
 
 const std = @import("std");
 const dusty = @import("dusty");
 const http_server = @import("http/server.zig");
 const Server = @import("server.zig").Server;
-const RouteId = @import("router.zig").Route.Id;
+
+/// Which route a request matched: the name /debug/stats reports its timing under.
+pub const Id = enum {
+    discovery,
+    jobs_query,
+    jobs_get_query_results,
+    jobs_insert,
+    /// A load job's configuration and its bytes, together.
+    upload_jobs_insert,
+    /// A resumable session's bytes, or a query for how many of them landed.
+    upload_jobs_resume,
+    jobs_get,
+    jobs_list,
+    datasets_insert,
+    datasets_list,
+    datasets_get,
+    datasets_delete,
+    datasets_patch,
+    tables_insert,
+    tables_list,
+    tables_get,
+    tables_delete,
+    tables_patch,
+    tabledata_insert_all,
+    tabledata_list,
+    debug_stats,
+};
 
 /// The value-returning form of a route, with the request's path params.
 pub const Call = *const fn (
@@ -25,7 +53,7 @@ pub const Entry = struct {
     method: std.http.Method,
     /// dusty syntax: `:name` binds one segment.
     pattern: []const u8,
-    id: RouteId,
+    id: Id,
     call: Call,
 };
 
@@ -154,7 +182,7 @@ fn actionFor(comptime call: Call) fn (
 fn route(
     comptime method: std.http.Method,
     comptime pattern: []const u8,
-    comptime id: RouteId,
+    comptime id: Id,
     comptime handler: anytype,
 ) Entry {
     return .{ .method = method, .pattern = pattern, .id = id, .call = bind(pattern, id, handler) };
@@ -162,7 +190,7 @@ fn route(
 
 /// Adapts `handler` to Call. Its parameters after `s` and `req` take the pattern's params in
 /// pattern order; a count that does not match is a compile error.
-fn bind(comptime pattern: []const u8, comptime id: RouteId, comptime handler: anytype) Call {
+fn bind(comptime pattern: []const u8, comptime id: Id, comptime handler: anytype) Call {
     const names = comptime paramNames(pattern);
     const info = @typeInfo(@TypeOf(handler)).@"fn";
     // Zig 0.17 replaced `params` with `param_types`.
@@ -206,7 +234,7 @@ fn paramNames(pattern: []const u8) []const []const u8 {
 }
 
 /// Runs `req` through the routes in `table` the way the server matches them, without a socket.
-/// Null when no route matches, where the server falls back to `App.notFound`.
+/// Null when no route matches.
 pub fn callMatching(s: *Server, req: *const http_server.Request) !?http_server.Response {
     // dusty's Request points its params into itself, so it stays here while the call runs.
     var dreq: dusty.Request = undefined;
@@ -217,7 +245,7 @@ pub fn callMatching(s: *Server, req: *const http_server.Request) !?http_server.R
 const testing = std.testing;
 
 /// The id of the route `method path` matches, or null.
-fn matchedId(arena: std.mem.Allocator, method: std.http.Method, path: []const u8) !?RouteId {
+fn matchedId(arena: std.mem.Allocator, method: std.http.Method, path: []const u8) !?Id {
     var dreq: dusty.Request = undefined;
     const e = try match(arena, method, path, &dreq) orelse return null;
     return e.id;
@@ -238,8 +266,8 @@ test "a trailing slash and an empty segment match the route" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expectEqual(RouteId.debug_stats, (try matchedId(arena, .GET, "/debug/stats/")).?);
-    try testing.expectEqual(RouteId.debug_stats, (try matchedId(arena, .GET, "/debug//stats")).?);
+    try testing.expectEqual(Id.debug_stats, (try matchedId(arena, .GET, "/debug/stats/")).?);
+    try testing.expectEqual(Id.debug_stats, (try matchedId(arena, .GET, "/debug//stats")).?);
 }
 
 test "HEAD is answered by the GET route" {
@@ -247,7 +275,7 @@ test "HEAD is answered by the GET route" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectEqual(
-        RouteId.discovery,
+        Id.discovery,
         (try matchedId(arena, .HEAD, "/discovery/v1/apis/bigquery/v2/rest")).?,
     );
 }
@@ -256,8 +284,8 @@ test "a method a path has no route for, or an unknown path, matches nothing" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/debug/stats"));
-    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .GET, "/no/such/path"));
+    try testing.expectEqual(@as(?Id, null), try matchedId(arena, .POST, "/debug/stats"));
+    try testing.expectEqual(@as(?Id, null), try matchedId(arena, .GET, "/no/such/path"));
 }
 
 test "insertAll and data sit under the table path" {
@@ -265,11 +293,11 @@ test "insertAll and data sit under the table path" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectEqual(
-        RouteId.tabledata_insert_all,
+        Id.tabledata_insert_all,
         (try matchedId(arena, .POST, "/projects/p/datasets/ds/tables/t/insertAll")).?,
     );
     try testing.expectEqual(
-        RouteId.tabledata_list,
+        Id.tabledata_list,
         (try matchedId(arena, .GET, "/projects/p/datasets/ds/tables/t/data")).?,
     );
 }
@@ -278,7 +306,7 @@ test "a table literally named insertAll is a table GET" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try testing.expectEqual(
-        RouteId.tables_get,
+        Id.tables_get,
         (try matchedId(arena_state.allocator(), .GET, "/projects/p/datasets/ds/tables/insertAll")).?,
     );
 }
@@ -289,7 +317,7 @@ test "params bind by name and arrive percent-decoded" {
     var dreq: dusty.Request = undefined;
     // BigQuery decodes path ids: tables/t%5Fx answers for table t_x.
     const e = (try match(arena_state.allocator(), .GET, "/projects/p/datasets/d/tables/t%5Fx", &dreq)).?;
-    try testing.expectEqual(RouteId.tables_get, e.id);
+    try testing.expectEqual(Id.tables_get, e.id);
     try testing.expectEqualStrings("p", dreq.params.get("project").?);
     try testing.expectEqualStrings("d", dreq.params.get("dataset").?);
     try testing.expectEqualStrings("t_x", dreq.params.get("table").?);
@@ -299,19 +327,19 @@ test "the same path under different methods is different routes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expectEqual(RouteId.jobs_insert, (try matchedId(arena, .POST, "/projects/p/jobs")).?);
-    try testing.expectEqual(RouteId.jobs_list, (try matchedId(arena, .GET, "/projects/p/jobs")).?);
+    try testing.expectEqual(Id.jobs_insert, (try matchedId(arena, .POST, "/projects/p/jobs")).?);
+    try testing.expectEqual(Id.jobs_list, (try matchedId(arena, .GET, "/projects/p/jobs")).?);
 }
 
 test "a missing id or an extra segment matches nothing" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .DELETE, "/projects/p/queries"));
-    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/projects//queries"));
-    try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/projects/p"));
+    try testing.expectEqual(@as(?Id, null), try matchedId(arena, .DELETE, "/projects/p/queries"));
+    try testing.expectEqual(@as(?Id, null), try matchedId(arena, .POST, "/projects//queries"));
+    try testing.expectEqual(@as(?Id, null), try matchedId(arena, .POST, "/projects/p"));
     try testing.expectEqual(
-        @as(?RouteId, null),
+        @as(?Id, null),
         try matchedId(arena, .GET, "/projects/p/queries/job/extra"),
     );
 }

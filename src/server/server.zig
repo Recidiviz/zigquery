@@ -25,7 +25,6 @@ const OpenFailure = zigquery.sqlite.OpenFailure;
 const sqlite_c = zigquery.sqlite.c;
 
 const http_server = @import("http/server.zig");
-const router = @import("router.zig");
 const route_table = @import("routes.zig");
 const errors = @import("error.zig");
 const json_pb = @import("json_pb.zig");
@@ -142,8 +141,8 @@ pub const Server = struct {
     /// Resumable uploads this process is part way through.
     uploads: upload.SessionStore,
     /// Per-route timing, indexed by Route.Id.
-    route_stats: std.enums.EnumArray(router.Route.Id, stats_mod.RouteStats) =
-        std.enums.EnumArray(router.Route.Id, stats_mod.RouteStats).initFill(.{}),
+    route_stats: std.enums.EnumArray(route_table.Id, stats_mod.RouteStats) =
+        std.enums.EnumArray(route_table.Id, stats_mod.RouteStats).initFill(.{}),
     /// The slowest query jobs seen. A route percentile says the p99 is 33 ms;
     /// this says *which statement* that was, which is the difference between
     /// a number and a lead.
@@ -297,7 +296,7 @@ pub const Server = struct {
     }
 
     pub fn handler(s: *Server) http_server.Handler {
-        return .{ .ctx = s, .func = dispatch, .mutex = &s.engine_mutex, .io = s.io };
+        return .{ .ctx = s, .func = unexpectedPath, .mutex = &s.engine_mutex, .io = s.io };
     }
 
     /// Runs `f` with the engine lock held.
@@ -311,41 +310,23 @@ pub const Server = struct {
         return f(ctx, s);
     }
 
-    fn dispatch(ctx: *anyopaque, req: *const http_server.Request) anyerror!http_server.Response {
-        const s: *Server = @ptrCast(@alignCast(ctx));
-        const arena = req.arena;
-
-        switch (router.match(req.method, req.path)) {
-            .not_found, .method_not_allowed => {
-                // Go has no 404: unmatched paths fall through to
-                // defaultHandler, which returns 500 internalError
-                // "unexpected request path: ..." (handler.go:3598-3603).
-                return .{
-                    .status = .internal_server_error,
-                    .body = try errors.body(
-                        arena,
-                        .internal_error,
-                        try std.fmt.allocPrint(
-                            arena,
-                            "unexpected request path: {s}",
-                            .{req.path},
-                        ),
-                    ),
-                };
-            },
-            .matched => |m| {
-                const t0 = nowSeed();
-                const res = try s.route(req, m);
-                s.route_stats.getPtr(m.route).record(nowSeed() -| t0);
-                return res;
-            },
-        }
+    /// What a request no route matches gets. Go has no 404: unmatched paths fall through to
+    /// defaultHandler, which returns 500 internalError "unexpected request path: ..."
+    /// (handler.go:3598-3603).
+    fn unexpectedPath(
+        _: *anyopaque,
+        req: *const http_server.Request,
+    ) anyerror!http_server.Response {
+        return internalError(
+            req.arena,
+            try std.fmt.allocPrint(req.arena, "unexpected request path: {s}", .{req.path}),
+        );
     }
 
     /// Answers `req` as the REST server would, without a socket or the engine lock.
     pub fn respondTo(s: *Server, req: *const http_server.Request) !http_server.Response {
         if (try route_table.callMatching(s, req)) |res| return res;
-        return dispatch(s, req);
+        return unexpectedPath(s, req);
     }
 
     /// jobs.list: not implemented, because listing needs the jobs metadata table.
@@ -368,41 +349,8 @@ pub const Server = struct {
     }
 
     /// Adds the time since `t0` to the route's /debug/stats entry.
-    pub fn recordRoute(s: *Server, id: router.Route.Id, t0: u64) void {
+    pub fn recordRoute(s: *Server, id: route_table.Id, t0: u64) void {
         s.route_stats.getPtr(id).record(nowSeed() -| t0);
-    }
-
-    fn route(
-        _: *Server,
-        _: *const http_server.Request,
-        m: router.Match,
-    ) !http_server.Response {
-        return switch (m.route) {
-            // routes.zig matches these before a request reaches router.zig.
-            .discovery,
-            .debug_stats,
-            .datasets_insert,
-            .datasets_list,
-            .datasets_get,
-            .datasets_delete,
-            .datasets_patch,
-            .tables_insert,
-            .tables_list,
-            .tables_get,
-            .tables_patch,
-            .tables_delete,
-            .tabledata_list,
-            .tabledata_insert_all,
-            .jobs_query,
-            .jobs_get_query_results,
-            .jobs_insert,
-            .jobs_list,
-            .jobs_get,
-            .upload_jobs_insert,
-            .upload_jobs_resume,
-            => unreachable,
-
-        };
     }
 
     /// server/handler.go jobsQueryHandler.

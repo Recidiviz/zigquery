@@ -300,8 +300,7 @@ pub const App = struct {
 /// The handler's view of a request dusty parsed, or null for a method outside methodFrom.
 pub fn requestFrom(req: *dusty.Request, ctx: *const App.RequestContext) !?Request {
     const method = methodFrom(req.method) orelse return null;
-    // dusty's own `path` is percent-decoded; the router.zig fallback matches the encoded form,
-    // so split the raw target instead.
+    // The raw target, as the client sent it; route params come decoded from dusty.
     const q = std.mem.indexOfScalar(u8, req.url, '?');
     return .{
         .method = method,
@@ -428,7 +427,7 @@ const unsupported_encoding_body =
     \\{"error":{"errors":[{"reason":"invalid","location":"","debugInfo":"","message":"unsupported content encoding"}],"code":415,"message":"unsupported content encoding"}}
 ;
 
-/// The RFC 9110 methods plus PATCH; the router answers those it has no route for. Any other
+/// The RFC 9110 methods plus PATCH, which reach the Handler when no route matches. Any other
 /// (WebDAV and the like) is a 405.
 fn methodFrom(m: dusty.Method) ?http.Method {
     return switch (m) {
