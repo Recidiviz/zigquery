@@ -46,6 +46,11 @@ docker run -p 9050:9050 -v zigquery-data:/data ghcr.io/recidiviz/zigquery:latest
 
 [See docs/BUILD.md](./docs/BUILD.md) for environment setup and build commands.
 
+## Contributing
+
+Start from an issue that a maintainer filed or accepted, then open a pull request that links it.
+People and coding agents alike follow [AGENTS.md](./AGENTS.md).
+
 ## Why Zig?
 
 [GoogleSQL](https://github.com/google/googlesql)'s query analyzer powers the core of the emulator.
