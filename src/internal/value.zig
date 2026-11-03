@@ -480,24 +480,86 @@ fn renderDecimal(
     return out.toOwnedSlice(alloc);
 }
 
-/// The value as an f64.
+/// The value as an f64: the nearest double, ties to even.
 ///
-/// Go big.Rat.Float64 divided the reduced numerator by the reduced
-/// denominator; dividing the unscaled value by its scaling factor is the same
-/// quotient. The halves are converted separately because LLVM has no
-/// integer-to-double libcall wider than 128 bits — `sitofp i256 to double` is
-/// an "unsupported library call operation" at codegen — and because 2^128 is
-/// exact in f64, the split costs no accuracy the 53-bit mantissa would keep.
+/// Every NUMERIC and BIGNUMERIC value lies between 1e-38 and 5.8e76 in
+/// magnitude, so the result is always a normal double.
 fn unscaledToFloat(unscaled: i256, scale: usize) f64 {
-    const negative = unscaled < 0;
-    const mag: u256 = @intCast(if (negative) -unscaled else unscaled);
-    const hi: u128 = @truncate(mag >> 128);
-    const lo: u128 = @truncate(mag);
-    const two_128: f64 = 340282366920938463463374607431768211456.0; // 2^128
-    const n_f: f64 = @as(f64, @floatFromInt(hi)) * two_128 + @as(f64, @floatFromInt(lo));
-    const d_f: f64 = @floatFromInt(pow_ten_table[scale]);
-    const q = n_f / d_f;
-    return if (negative) -q else q;
+    const mag: u256 = @abs(unscaled);
+    const den: u128 = pow_ten_table[scale];
+    const q = if (mag == 0)
+        0
+    else if (mag < max_exact_int and scale <= max_exact_pow10)
+        // Both operands are exact doubles, so one IEEE division rounds once.
+        @as(f64, @floatFromInt(@as(u64, @intCast(mag)))) / @as(f64, @floatFromInt(den))
+    else
+        nearestQuotient(mag, den);
+    return if (unscaled < 0) -q else q;
+}
+
+/// 2^53: integers below it are exact doubles.
+const max_exact_int: u256 = 1 << 53;
+/// 10^22 is the largest power of ten that is an exact double.
+const max_exact_pow10: usize = 22;
+
+/// `num / den` as the nearest double, ties to even, for a nonzero `num`.
+///
+/// A floating-point estimate lands within a couple of ulps; exact integer
+/// comparisons against the midpoints either side of it then step it onto the
+/// nearest double. Comparing needs only multiplies and shifts, where computing
+/// the quotient exactly would need a 512-bit division.
+fn nearestQuotient(num: u256, den: u128) f64 {
+    const num_hi: u128 = @truncate(num >> 128);
+    const num_lo: u128 = @truncate(num);
+    const num_f = @as(f64, @floatFromInt(num_hi)) * 0x1p128 + @as(f64, @floatFromInt(num_lo));
+    var q = num_f / @as(f64, @floatFromInt(den));
+    while (true) {
+        const up = std.math.nextAfter(f64, q, std.math.inf(f64));
+        const above = orderToMidpoint(num, den, q, up);
+        if (above == .gt or (above == .eq and isOddMantissa(q))) {
+            q = up;
+            continue;
+        }
+        const down = std.math.nextAfter(f64, q, 0);
+        const below = orderToMidpoint(num, den, q, down);
+        if (below == .lt or (below == .eq and isOddMantissa(q))) {
+            q = down;
+            continue;
+        }
+        return q;
+    }
+}
+
+/// How `num / den` orders against the midpoint of two adjacent positive
+/// normal doubles.
+fn orderToMidpoint(num: u256, den: u128, a: f64, b: f64) std.math.Order {
+    const da = decompose(a);
+    const db = decompose(b);
+    // a + b = sum * 2^low, so the midpoint is sum * 2^(low - 1).
+    const low = @min(da.exp, db.exp);
+    const sum = (@as(u64, da.mantissa) << @intCast(da.exp - low)) +
+        (@as(u64, db.mantissa) << @intCast(db.exp - low));
+    const k = low - 1;
+    const scaled_den = @as(u512, den) * sum;
+    if (k >= 0) return std.math.order(@as(u512, num), scaled_den << @intCast(k));
+    return std.math.order(@as(u512, num) << @intCast(-k), scaled_den);
+}
+
+/// A positive normal double as `mantissa * 2^exp`, the mantissa's 53 bits
+/// including the implicit leading one.
+fn decompose(f: f64) struct { mantissa: u64, exp: i32 } {
+    const bits: u64 = @bitCast(f);
+    const fraction_bits = std.math.floatFractionalBits(f64);
+    const biased: i32 = @intCast(bits >> fraction_bits);
+    const fraction = bits & ((@as(u64, 1) << fraction_bits) - 1);
+    return .{
+        .mantissa = fraction | (@as(u64, 1) << fraction_bits),
+        .exp = biased - std.math.floatExponentMax(f64) - fraction_bits,
+    };
+}
+
+fn isOddMantissa(f: f64) bool {
+    return @as(u64, @bitCast(f)) & 1 == 1;
 }
 
 /// 10^e for every exponent NUMERIC and BIGNUMERIC can ask for. BIGNUMERIC's
@@ -3292,6 +3354,52 @@ test "numericFromTwosComplement (proto byte layout)" {
     const r5 = try numericFromTwosComplement(alloc, &.{0xff}, 9, false);
     try std.testing.expectEqual(@as(i256, -1), r5.numeric.unscaled);
     try std.testing.expectEqualStrings("-0.000000001", try r5.numeric.toText(alloc));
+}
+
+test "numeric to f64 is the nearest double, ties to even" {
+    const two_53: i256 = 9007199254740992;
+    const cases = [_]struct { unscaled: i256, big: bool, want: f64 }{
+        .{ .unscaled = 198207565116982509, .big = false, .want = 198207565.11698252 },
+        .{ .unscaled = pow10(i256, 37), .big = true, .want = 0.1 },
+        .{ .unscaled = 1, .big = false, .want = 1e-9 },
+        .{ .unscaled = 1, .big = true, .want = 1e-38 },
+        .{ .unscaled = numeric_unscaled_max, .big = false, .want = 1e29 },
+        .{ .unscaled = -numeric_unscaled_max, .big = false, .want = -1e29 },
+        .{ .unscaled = std.math.maxInt(i256), .big = true, .want = 5.7896044618658096e38 },
+        .{ .unscaled = std.math.minInt(i256), .big = true, .want = -5.7896044618658096e38 },
+        // Exactly halfway between two doubles: 2^53 + 1 and 2^53 + 3 go to the even neighbour.
+        .{ .unscaled = (two_53 + 1) * pow10(i256, 9), .big = false, .want = 9007199254740992 },
+        .{ .unscaled = (two_53 + 3) * pow10(i256, 9), .big = false, .want = 9007199254740996 },
+        .{ .unscaled = 0, .big = true, .want = 0 },
+    };
+    for (cases) |tc| {
+        const n: Numeric = .{ .unscaled = tc.unscaled, .is_bignumeric = tc.big };
+        try std.testing.expectEqual(tc.want, n.toFloat());
+    }
+}
+
+test "numeric to f64 matches parsing its decimal text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Digit counts spread across each kind's whole range, so both the exact-division shortcut
+    // and the integer path are exercised, at every magnitude.
+    var prng = std.Random.DefaultPrng.init(0x6e756d6572696373);
+    const random = prng.random();
+    for ([_]bool{ false, true }) |big| {
+        const max_digits: u8 = if (big) 76 else 38;
+        for (0..100_000) |_| {
+            const digits = random.intRangeAtMost(u8, 1, max_digits);
+            var unscaled: i256 = 0;
+            for (0..digits) |_| unscaled = unscaled * 10 + random.intRangeAtMost(u8, 0, 9);
+            if (random.boolean()) unscaled = -unscaled;
+            const n: Numeric = .{ .unscaled = unscaled, .is_bignumeric = big };
+            const want = try std.fmt.parseFloat(f64, try n.toText(alloc));
+            try std.testing.expectEqual(want, n.toFloat());
+        }
+        _ = arena.reset(.retain_capacity);
+    }
 }
 
 test "numeric rounding breaks ties away from zero" {

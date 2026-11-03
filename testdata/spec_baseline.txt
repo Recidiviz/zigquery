@@ -5342,6 +5342,7 @@ zigquery/types/interval	interval from sub operator
 zigquery/types/numeric	int64 vs numeric and bignumeric
 zigquery/types/numeric	int64 extremes vs numeric
 zigquery/types/numeric	int64 past float precision vs numeric
+zigquery/types/numeric	float64 vs numeric, inexact decimals
 zigquery/types/numeric	float64 vs numeric, more digits than a double
 zigquery/types/numeric	float64 extremes vs numeric maxima
 zigquery/types/numeric	literal operands
@@ -5358,6 +5359,7 @@ zigquery/types/numeric	JOIN float64 to numeric
 zigquery/types/numeric	JOIN numeric to bignumeric
 zigquery/types/numeric	JOIN USING int64 and numeric
 zigquery/types/numeric	array literal mixing kinds
+zigquery/types/numeric	NUMERIC to FLOAT64 rounds to nearest
 zigquery/types/numeric	BIGNUMERIC literal to FLOAT64
 zigquery/types/numeric	FLOAT64 to NUMERIC and BIGNUMERIC
 zigquery/types/struct	struct with bool
