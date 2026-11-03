@@ -38,6 +38,7 @@ import concurrent.futures
 import datetime
 import decimal
 import math
+import pathlib
 import re
 import subprocess
 import sys
@@ -45,7 +46,7 @@ import threading
 
 from google.cloud import bigquery
 
-ENGINE = "./zig-out/bin/zigquery"
+ENGINE = "./zig-out/bin/zigquery-cli"
 
 # `.sql = "..."` on one line, or a `\\`-prefixed multiline block.
 DESC = re.compile(r'\s*\.desc = "((?:[^"\\]|\\.)*)"')
@@ -96,9 +97,11 @@ FRACTION = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
 def trim_fraction(s):
     """Fractional seconds without trailing zeros. BigQuery's string form and the
     CLI both drop them; Python's isoformat pads to six digits."""
+
     def sub(m):
         digits = m.group(2).rstrip("0")
         return m.group(1) + ("." + digits if digits else "")
+
     return FRACTION.sub(sub, s)
 
 
@@ -239,12 +242,8 @@ def classify(ours, theirs):
             and any(x != y for ro, rt in zip(ours, theirs)
                     for x, y in zip(ro.values(), rt.values()))):
         return "render"
-    ovals = [sorted(r.values()) for r in ours]
-    bvals = [sorted(r.values()) for r in theirs]
-    if ovals == bvals:
-        return "name"
     key = lambda rows: sorted(tuple(sorted(r.items())) for r in rows)
-    if key(ours) == key(theirs) or sorted(map(tuple, ovals)) == sorted(map(tuple, bvals)):
+    if key(ours) == key(theirs):
         return "order"
     return "diff"
 
@@ -259,41 +258,79 @@ def compare(case, project):
         return "error", spec, desc, sql, f"{type(e).__name__}: {e}"[:240], None, None, None, False
 
 
+ANONYMOUS_COLUMN_RE_ENGINE = re.compile(r"\$col\d+")
+ANONYMOUS_COLUMN_RE_BQ = re.compile(r"f\d+_")
+
+
+def same_name(ko, kt):
+    """Whether two anonymous columns name the same column."""
+    if ko == kt:
+        return True
+
+    return bool(
+        ANONYMOUS_COLUMN_RE_ENGINE.fullmatch(ko)
+        and kt is not None
+        and ANONYMOUS_COLUMN_RE_BQ.fullmatch(kt)
+    )
+
+
 def align(ours, theirs):
     """Canonicalise both sides, pairing columns by name where the two agree on
     them and by position otherwise (an anonymous column is `$col1` here and
-    `f0_` there)."""
-    out_o, out_t = [], []
+    `f0_` there).
+
+    Returns the two row lists and whether any column is named differently, so
+    a renamed column is reported rather than absorbed by positional pairing."""
+    out_o, out_t, names_differ = [], [], False
     for ro, rt in zip(ours, theirs):
         keys_t = list(rt)
         by_name = set(ro) == set(keys_t)
         co, ct = {}, {}
         for i, ko in enumerate(ro):
             kt = ko if by_name else (keys_t[i] if i < len(keys_t) else None)
+            if not by_name and not same_name(ko, kt):
+                names_differ = True
             tval = rt.get(kt) if kt is not None else None
             name = ko if by_name else f"c{i}"
             co[name] = canon_engine_cell(ro[ko], isinstance(tval, (list, dict)))
             ct[name] = canon(tval)
         out_o.append(co)
         out_t.append(ct)
-    return out_o, out_t
+    return out_o, out_t, names_differ
 
 
 def _compare(case, project):
     spec, desc, sql = case
     ours, oerr = run_engine(sql)
     theirs, berr, cached = run_bq(sql, project)
+    names_differ = False
     if not (oerr or berr):
         if len(ours) != len(theirs):
             ours = [{k: canon_engine_cell(v) for k, v in r.items()} for r in ours]
             theirs = [{k: canon(v) for k, v in r.items()} for r in theirs]
         else:
-            ours, theirs = align(ours, theirs)
+            ours, theirs, names_differ = align(ours, theirs)
     if oerr or berr:
         # Both refusing is agreement about the language, not a divergence.
         verdict = "both-reject" if (oerr and berr) else "error"
         return verdict, spec, desc, sql, oerr, berr, ours, theirs, cached
-    return classify(ours, theirs), spec, desc, sql, None, None, ours, theirs, cached
+    verdict = classify(ours, theirs)
+    if verdict == "agree" and names_differ:
+        verdict = "name"
+    return verdict, spec, desc, sql, None, None, ours, theirs, cached
+
+
+def check_engine():
+    """Refuse a missing or stale engine binary."""
+    engine = pathlib.Path(ENGINE)
+    if not engine.exists():
+        sys.exit(f"{ENGINE} not found; build it with `zig build -Drelease=true`")
+    built = engine.stat().st_mtime
+    sources = [p for d in ("src", "entrypoints") for p in pathlib.Path(d).rglob("*.zig")]
+    newer = [p for p in sources if p.stat().st_mtime > built]
+    if newer:
+        sys.exit(f"{ENGINE} is older than {len(newer)} source file(s), e.g. {newer[0]}; "
+                 "rebuild with `zig build -Drelease=true`")
 
 
 def main():
@@ -305,6 +342,8 @@ def main():
     ap.add_argument("--quiet", action="store_true",
                     help="report real divergences only")
     args = ap.parse_args()
+
+    check_engine()
 
     todo = [c for p in args.paths for c in cases(p)]
     print(f"-- {len(todo)} cases, {args.jobs} at a time, project {args.project}\n")
