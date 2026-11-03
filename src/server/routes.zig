@@ -30,6 +30,7 @@ pub const Entry = struct {
 };
 
 const tables_one = "/projects/:project/datasets/:dataset/tables/:table";
+const upload_jobs = "/upload/bigquery/v2/projects/:project/jobs";
 
 pub const table = [_]Entry{
     route(.GET, "/discovery/v1/apis/bigquery/v2/rest", .discovery, Server.handleDiscovery),
@@ -53,6 +54,13 @@ pub const table = [_]Entry{
     route(.POST, "/projects/:project/jobs", .jobs_insert, Server.handleJobsInsert),
     route(.GET, "/projects/:project/jobs", .jobs_list, Server.handleJobsList),
     route(.GET, "/projects/:project/jobs/:job", .jobs_get, Server.handleJobsGet),
+    // The media upload endpoint. The discovery document gives the resumable protocol its own
+    // `/resumable` prefix while the prose uses `/upload` with `uploadType=resumable`, so both
+    // spellings reach the same handlers. api-uploads
+    route(.POST, upload_jobs, .upload_jobs_insert, Server.handleUploadInsert),
+    route(.PUT, upload_jobs, .upload_jobs_resume, Server.handleUploadResume),
+    route(.POST, "/resumable" ++ upload_jobs, .upload_jobs_insert, Server.handleUploadInsert),
+    route(.PUT, "/resumable" ++ upload_jobs, .upload_jobs_resume, Server.handleUploadResume),
 };
 
 /// Every entry of `table` under each prefix it is registered at, path included.

@@ -68,35 +68,7 @@ pub const Route = struct {
 };
 
 /// The implemented surface.
-pub const routes = [_]Route{
-
-    // The media upload endpoint. The discovery document gives the resumable protocol its own
-    // `/resumable` prefix while the prose uses `/upload` with `uploadType=resumable`, so both
-    // spellings reach the same handlers. api-uploads
-    .{
-        .id = .upload_jobs_insert,
-        .method = .POST,
-        .pattern = "/upload/bigquery/v2/projects/*/jobs",
-    },
-    .{
-        .id = .upload_jobs_resume,
-        .method = .PUT,
-        .pattern = "/upload/bigquery/v2/projects/*/jobs",
-    },
-    .{
-        .id = .upload_jobs_insert,
-        .method = .POST,
-        .pattern = "/resumable/upload/bigquery/v2/projects/*/jobs",
-    },
-    .{
-        .id = .upload_jobs_resume,
-        .method = .PUT,
-        .pattern = "/resumable/upload/bigquery/v2/projects/*/jobs",
-    },
-
-
-
-};
+pub const routes = [_]Route{};
 
 /// Go registers every handler twice: bare, and under `/bigquery/v2`
 /// (server.go:92-97). Clients configured with an `api_endpoint` use the

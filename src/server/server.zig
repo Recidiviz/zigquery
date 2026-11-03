@@ -373,8 +373,8 @@ pub const Server = struct {
     }
 
     fn route(
-        s: *Server,
-        req: *const http_server.Request,
+        _: *Server,
+        _: *const http_server.Request,
         m: router.Match,
     ) !http_server.Response {
         return switch (m.route) {
@@ -398,9 +398,9 @@ pub const Server = struct {
             .jobs_insert,
             .jobs_list,
             .jobs_get,
+            .upload_jobs_insert,
+            .upload_jobs_resume,
             => unreachable,
-            .upload_jobs_insert => s.handleUploadInsert(req, m.captures.get(0)),
-            .upload_jobs_resume => s.handleUploadResume(req, m.captures.get(0)),
 
         };
     }
@@ -1497,7 +1497,7 @@ pub const Server = struct {
     // ---- the media upload endpoint ----
 
     /// `POST /upload/...`, which either carries the whole job or opens a resumable session.
-    fn handleUploadInsert(
+    pub fn handleUploadInsert(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -1564,7 +1564,7 @@ pub const Server = struct {
     }
 
     /// `PUT` to a session URI: another chunk, or a question about how many bytes landed.
-    fn handleUploadResume(
+    pub fn handleUploadResume(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
