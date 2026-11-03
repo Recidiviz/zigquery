@@ -1,23 +1,24 @@
 //! Replaces bigquery-emulator's use of net/http + gorilla/mux — REDESIGNED,
-//! not ported. Go gets an accept loop, routing, and middleware chaining from
-//! the standard library; Zig 0.16's `std.http.Server` is explicitly only "a
-//! single connection lifecycle", so the accept loop lives here.
+//! not ported. dusty owns the sockets: accepting, HTTP/1.1 parsing,
+//! keep-alive, chunked and gzip request bodies, and `Expect: 100-continue`.
+//! This file turns each request dusty parses into a `Request`, runs the one
+//! `Handler` under its mutex, and writes the `Response` back.
 //!
 //! Differences from Go, by design:
 //! - No middleware chain. Go threads request-scoped values through
 //!   context.Context with eight keys (server/context.go) and eleven
 //!   middlewares that populate them; here a `Request` carries what handlers
 //!   need as plain fields.
-//! - No sequentialAccessMiddleware. Go serializes every request behind one
-//!   package-level mutex (server/middleware.go:19-28, added upstream in a
-//!   commit titled only "improve performance"); this server does not, which
-//!   is the point of the port.
+//! - No routing here. Every request reaches dusty's not-found hook, and
+//!   src/server/router.zig matches it, because that router binds path
+//!   variables by position and dusty's binds them by name.
 //!
-//! HTTP/1.1 only. Zig 0.16 std has no HTTP/2, no HPACK, and no TLS server;
-//! the BigQuery REST clients speak cleartext HTTP/1.1 to an emulator.
+//! HTTP/1.1 only, cleartext: the BigQuery REST clients speak plain HTTP/1.1
+//! to an emulator.
 // ephor:ignore-file ZA301 ZA302 ZT105
 
 const std = @import("std");
+const dusty = @import("dusty");
 
 /// The 500 a failed handler answers with, spelled out rather than built: this
 /// path runs after something already went wrong, so it must not allocate.
@@ -27,27 +28,15 @@ pub const internal_error_body =
 ;
 const http = std.http;
 
-/// Request head buffer. `std.http.Server` sets max_head_len to the length of
-/// the connection reader's buffer, so this is the hard cap on request line +
-/// headers. Google's clients send long URLs and many headers; 16 KiB matches
-/// the 8 KiB gRPC guidance with room to spare.
-const head_buffer_len = 16 * 1024;
-/// Body chunks and, when the client compresses, the decompression window.
-const body_buffer_len = 64 * 1024;
-const decompress_buffer_len = 64 * 1024;
-/// Response bytes buffered before hitting the socket.
-const write_buffer_len = 64 * 1024;
-
-/// Largest request body accepted, matching no specific Go limit — Go has
-/// none — but preventing a hostile client from exhausting the arena.
+/// Largest request body accepted, after decompression. Go has no limit; this
+/// one keeps a hostile client from exhausting the request arena.
 pub const max_body_len = 64 * 1024 * 1024;
 
 /// The request headers a handler can read.
 ///
-/// An allow-list rather than the whole set: the values have to be copied out of the head
-/// before the body read invalidates them, and duplicating every header on every request to
-/// serve the upload routes would charge each query for them. Adding one is a line here and a
-/// line in `headersFrom`.
+/// An allow-list rather than the whole set keeps `Request` free of dusty's
+/// types, so handlers and their tests build one from plain slices. Adding a
+/// header is a field here and a line in `headersFrom`.
 pub const Headers = struct {
     /// `multipart/related; boundary=...` on a multipart upload.
     content_type: ?[]const u8 = null,
@@ -144,244 +133,225 @@ pub const Options = struct {
 pub const Server = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    listener: std.Io.net.Server,
-    /// Carries the mutex that serializes dispatch. Connections are served on
-    /// their own threads (see `serve`), but the engine behind the handler is
-    /// single-threaded per Db and the server holds one. Accepting concurrently
-    /// while dispatching serially is what removes the deadlock without
-    /// requiring a connection pool.
-    handler: Handler,
+    endpoint: Endpoint,
+    listeners: [1]dusty.Listener,
+    inner: dusty.Server(Endpoint),
+    /// The task running `inner.run`, from `listen` until `serve` or `deinit`
+    /// collects it.
+    running: ?std.Io.Future(anyerror!void) = null,
+    /// Set by the run task when `inner.run` returns before the listener was
+    /// up, so `listen` can tell a failed bind from a ready one.
+    failed: std.atomic.Value(bool) = .init(false),
 
+    /// Binds `opts.address:opts.port` and starts serving on it.
+    ///
+    /// Returns once the socket accepts connections, or with the bind error,
+    /// so a caller can announce readiness right after. Heap-allocated because
+    /// dusty keeps a pointer to `endpoint` for the server's life.
     pub fn listen(
         gpa: std.mem.Allocator,
         io: std.Io,
         opts: Options,
         handler: Handler,
-    ) !Server {
-        const addr = try std.Io.net.IpAddress.parse(opts.address, opts.port);
-        const listener = try std.Io.net.IpAddress.listen(&addr, io, .{
-            .reuse_address = true,
-        });
-        return .{ .gpa = gpa, .io = io, .listener = listener, .handler = handler };
+    ) !*Server {
+        const s = try gpa.create(Server);
+        errdefer gpa.destroy(s);
+        s.* = .{
+            .gpa = gpa,
+            .io = io,
+            .endpoint = .{ .handler = handler, .io = io },
+            .listeners = .{.{
+                .address = .{ .ip = try std.Io.net.IpAddress.parse(opts.address, opts.port) },
+            }},
+            .inner = undefined,
+        };
+        s.inner = .init(gpa, io, .{
+            .listeners = &s.listeners,
+            .timeout = .{
+                // A query or load job runs inside its request, for as long as
+                // the engine takes.
+                .request = null,
+                // Google's clients pool connections and reuse them after any
+                // idle gap; closing one under them shows up as a reset on
+                // their next call.
+                .keepalive = null,
+            },
+            .request = .{
+                .max_body_size = max_body_len,
+                // dusty parses the query string up front and answers 400 past
+                // this count. Handlers read it raw through Request.queryParam,
+                // so the cap only has to admit what clients send.
+                .max_query_count = 256,
+                // Send 400, 413 and 415 through `Endpoint.uncaughtError`, so
+                // they carry the BigQuery error shape like every other error.
+                .answer_client_errors = false,
+            },
+        }, &s.endpoint);
+        errdefer s.inner.deinit();
+
+        s.running = try io.concurrent(runInner, .{s});
+        s.inner.ready.waitUncancelable(io);
+        if (s.failed.load(.acquire)) {
+            const err = s.running.?.await(io);
+            s.running = null;
+            try err;
+            unreachable;
+        }
+        return s;
     }
 
+    fn runInner(s: *Server) anyerror!void {
+        s.inner.run() catch |err| {
+            // `ready` is only set once every listener is bound; wake `listen`
+            // when the run ends before that.
+            s.failed.store(true, .release);
+            s.inner.ready.set(s.io);
+            return err;
+        };
+    }
+
+    /// Stops accepting, lets the requests in flight finish, and frees the
+    /// server.
     pub fn deinit(s: *Server) void {
-        s.listener.deinit(s.io);
+        if (s.running) |*running| {
+            running.cancel(s.io) catch {};
+        }
+        s.inner.deinit();
+        s.gpa.destroy(s);
     }
 
-    /// Accepts connections and serves each on its own thread.
-    ///
-    /// A thread per connection is required, not an optimisation: HTTP
-    /// keep-alive means a client holds its connections open, and the Google
-    /// client libraries pool several. Serving one connection to completion
-    /// before accepting the next therefore deadlocks — the server sits in the
-    /// keep-alive read on connection 1 while the client waits on connections
-    /// it has opened but which are never accepted.
-    ///
-    /// Request handling is still serialized by `handler_mutex`, because the
-    /// engine is single-threaded per Db. Concurrency here buys liveness, not
-    /// throughput; throughput comes with the connection pool.
+    /// Serves until the process ends or the run task is canceled.
     pub fn serve(s: *Server) !void {
-        while (true) {
-            const stream = s.listener.accept(s.io) catch |err| switch (err) {
-                // shutdown() on the listening socket is the documented
-                // cancellation mechanism.
-                error.SocketNotListening, error.Canceled => return,
-                error.ConnectionAborted, error.BlockedByFirewall => continue,
-                else => return err,
-            };
-
-            const conn = s.gpa.create(Connection) catch {
-                var s2 = stream;
-                s2.close(s.io);
-                continue;
-            };
-            conn.* = .{ .server = s, .stream = stream };
-
-            const thread = std.Thread.spawn(.{}, Connection.run, .{conn}) catch {
-                // Out of threads: serve it inline rather than dropping it.
-                conn.run();
-                continue;
-            };
-            thread.detach();
-        }
-    }
-
-    const Connection = struct {
-        server: *Server,
-        stream: std.Io.net.Stream,
-
-        fn run(c: *Connection) void {
-            const s = c.server;
-            s.serveConnection(&c.stream) catch |err|
-                std.log.warn("connection dropped: {t}", .{err});
-            c.stream.close(s.io);
-            s.gpa.destroy(c);
-        }
-    };
-
-    fn serveConnection(s: *Server, stream: *std.Io.net.Stream) !void {
-        const read_buf = try s.gpa.alloc(u8, head_buffer_len);
-        defer s.gpa.free(read_buf);
-        const write_buf = try s.gpa.alloc(u8, write_buffer_len);
-        defer s.gpa.free(write_buf);
-
-        var reader = stream.reader(s.io, read_buf);
-        var writer = stream.writer(s.io, write_buf);
-        var conn = http.Server.init(&reader.interface, &writer.interface);
-
-        while (true) {
-            var request = conn.receiveHead() catch |err| switch (err) {
-                // Normal end of a kept-alive connection, not a failure.
-                error.HttpConnectionClosing => return,
-                else => return err,
-            };
-
-            var arena_state = std.heap.ArenaAllocator.init(s.gpa);
-            defer arena_state.deinit();
-
-            const keep_alive = s.serveRequest(&request, arena_state.allocator()) catch |err| blk: {
-                // Mirrors Go's recoveryMiddleware: report, do not drop the
-                // connection.
-                std.log.err("request failed: {s} {s}: {t}", .{
-                    @tagName(request.head.method),
-                    request.head.target,
-                    err,
-                });
-                request.respond(internal_error_body, .{
-                    .status = .internal_server_error,
-                    .extra_headers = &.{
-                        .{ .name = "content-type", .value = "application/json; charset=UTF-8" },
-                    },
-                }) catch return;
-                break :blk true;
-            };
-            if (!keep_alive) return;
-        }
-    }
-
-    /// Returns whether the connection may be reused.
-    /// Copies the allow-listed headers out of the head, which only holds them until the body
-    /// is read. Names compare case-insensitively, as HTTP defines them.
-    fn headersFrom(request: *http.Server.Request, arena: std.mem.Allocator) !Headers {
-        var out: Headers = .{};
-        var it = request.iterateHeaders();
-        while (it.next()) |header| {
-            const slot: *?[]const u8 =
-                if (std.ascii.eqlIgnoreCase(header.name, "content-type"))
-                    &out.content_type
-                else if (std.ascii.eqlIgnoreCase(header.name, "content-range"))
-                    &out.content_range
-                else if (std.ascii.eqlIgnoreCase(header.name, "x-upload-content-type"))
-                    &out.x_upload_content_type
-                else if (std.ascii.eqlIgnoreCase(header.name, "x-upload-content-length"))
-                    &out.x_upload_content_length
-                else if (std.ascii.eqlIgnoreCase(header.name, "host"))
-                    &out.host
-                else
-                    continue;
-            slot.* = try arena.dupe(u8, header.value);
-        }
-        return out;
-    }
-
-    fn serveRequest(
-        s: *Server,
-        request: *http.Server.Request,
-        arena: std.mem.Allocator,
-    ) !bool {
-        // Order matters: reading the body calls Head.invalidateStrings(), so
-        // anything borrowed from `head` must be copied out first or it
-        // becomes a dangling pointer.
-        const target = try arena.dupe(u8, request.head.target);
-        const method = request.head.method;
-        const headers = try headersFrom(request, arena);
-
-        const body = try readBody(request, arena);
-
-        const q = std.mem.indexOfScalar(u8, target, '?');
-        const req = Request{
-            .method = method,
-            .path = if (q) |i| target[0..i] else target,
-            .query = if (q) |i| target[i + 1 ..] else "",
-            .body = body,
-            .headers = headers,
-            .arena = arena,
+        const running = &(s.running orelse return);
+        const result = running.await(s.io);
+        s.running = null;
+        result catch |err| switch (err) {
+            error.Canceled => return,
+            else => return err,
         };
-
-        const res = blk: {
-            const waiting = stat_waiters_now.fetchAdd(1, .monotonic) + 1;
-            if (waiting > stat_waiters_max.load(.monotonic)) {
-                stat_waiters_max.store(waiting, .monotonic);
-            }
-            const t_arrive = std.Io.Clock.awake.now(s.io);
-
-            s.handler.mutex.lockUncancelable(s.handler.io);
-            const t_locked = std.Io.Clock.awake.now(s.io);
-            _ = stat_waiters_now.fetchSub(1, .monotonic);
-            defer s.handler.mutex.unlock(s.handler.io);
-
-            const out = try s.handler.func(s.handler.ctx, &req);
-            const t_done = std.Io.Clock.awake.now(s.io);
-
-            _ = stat_requests.fetchAdd(1, .monotonic);
-            _ = stat_wait_ns.fetchAdd(
-                @intCast(t_arrive.durationTo(t_locked).nanoseconds),
-                .monotonic,
-            );
-            _ = stat_handle_ns.fetchAdd(
-                @intCast(t_locked.durationTo(t_done).nanoseconds),
-                .monotonic,
-            );
-            break :blk out;
-        };
-
-        var response_headers: std.ArrayList(http.Header) = .empty;
-        try response_headers.append(
-            arena,
-            .{ .name = "content-type", .value = res.content_type },
-        );
-        try response_headers.appendSlice(arena, res.extra_headers);
-
-        try request.respond(res.body, .{
-            .status = res.status,
-            .extra_headers = response_headers.items,
-        });
-        // respond() consumed the body already; discardBody reports whether
-        // the connection survives.
-        return request.head.keep_alive;
     }
 };
 
-/// Reads and, if the client compressed it, decompresses the request body.
-///
-/// Google's client libraries do send `Content-Encoding: gzip` on request
-/// bodies — Go handles this in decompressMiddleware
-/// (server/middleware.go:84-102).
-fn readBody(request: *http.Server.Request, arena: std.mem.Allocator) ![]const u8 {
-    if (request.head.content_length == null and
-        request.head.transfer_encoding == .none) return "";
+/// The app dusty hands every request to. dusty has no routes registered, so
+/// each request reaches `notFound`, which is the dispatch entry point.
+const Endpoint = struct {
+    handler: Handler,
+    io: std.Io,
 
-    const transfer_buf = try arena.alloc(u8, body_buffer_len);
-    // readerExpectContinue also answers `Expect: 100-continue`, which the
-    // Google clients send on larger uploads.
-    const transfer_reader = try request.readerExpectContinue(transfer_buf);
+    pub fn notFound(e: *Endpoint, req: *dusty.Request, res: *dusty.Response) !void {
+        const method = methodFrom(req.method) orelse {
+            res.status = .method_not_allowed;
+            return;
+        };
+        // dusty's own `path` is percent-decoded; the router matches the
+        // encoded form, so split the raw target instead.
+        const q = std.mem.indexOfScalar(u8, req.url, '?');
+        const r: Request = .{
+            .method = method,
+            .path = if (q) |i| req.url[0..i] else req.url,
+            .query = if (q) |i| req.url[i + 1 ..] else "",
+            .body = try req.body() orelse "",
+            .headers = headersFrom(req),
+            .arena = req.arena,
+        };
 
-    if (request.head.transfer_compression == .identity) {
-        return transfer_reader.allocRemaining(arena, .limited(max_body_len));
+        const out = try e.dispatch(&r);
+
+        res.status = std.enums.fromInt(dusty.Status, @intFromEnum(out.status)) orelse
+            return error.UnsupportedStatus;
+        try res.header("Content-Type", out.content_type);
+        for (out.extra_headers) |h| try res.header(h.name, h.value);
+        res.body = out.body;
     }
 
-    // `decompress` owns the decoder state that `reader` borrows, so it has to
-    // outlive the read below — hence the read happens here, not at the call
-    // site.
-    const decompress_buf = try arena.alloc(u8, decompress_buffer_len);
-    var decompress: http.Decompress = undefined;
-    const reader = decompress.init(
-        transfer_reader,
-        decompress_buf,
-        request.head.transfer_compression,
-    );
-    return reader.allocRemaining(arena, .limited(max_body_len));
+    pub fn uncaughtError(req: *dusty.Request, res: *dusty.Response, err: anyerror) void {
+        res.header("Content-Type", "application/json; charset=UTF-8") catch |header_err|
+            std.log.warn("error response sent without a content type: {t}", .{header_err});
+        if (req.clientErrorStatus()) |status| {
+            res.status = status;
+            res.body = switch (status) {
+                .payload_too_large => too_large_body,
+                .unsupported_media_type => unsupported_encoding_body,
+                else => bad_request_body,
+            };
+            return;
+        }
+        // Mirrors Go's recoveryMiddleware: report, answer, keep the
+        // connection.
+        std.log.err("request failed: {t} {s}: {t}", .{ req.method, req.url, err });
+        res.status = .internal_server_error;
+        res.body = internal_error_body;
+    }
+
+    /// Runs the handler under its mutex, recording how long the request
+    /// waited for it and how long it held it.
+    fn dispatch(e: *Endpoint, r: *const Request) !Response {
+        const waiting = stat_waiters_now.fetchAdd(1, .monotonic) + 1;
+        if (waiting > stat_waiters_max.load(.monotonic)) {
+            stat_waiters_max.store(waiting, .monotonic);
+        }
+        const t_arrive = std.Io.Clock.awake.now(e.io);
+
+        e.handler.mutex.lockUncancelable(e.handler.io);
+        const t_locked = std.Io.Clock.awake.now(e.io);
+        _ = stat_waiters_now.fetchSub(1, .monotonic);
+        defer e.handler.mutex.unlock(e.handler.io);
+
+        const out = try e.handler.func(e.handler.ctx, r);
+        const t_done = std.Io.Clock.awake.now(e.io);
+
+        _ = stat_requests.fetchAdd(1, .monotonic);
+        _ = stat_wait_ns.fetchAdd(
+            @intCast(t_arrive.durationTo(t_locked).nanoseconds),
+            .monotonic,
+        );
+        _ = stat_handle_ns.fetchAdd(
+            @intCast(t_locked.durationTo(t_done).nanoseconds),
+            .monotonic,
+        );
+        return out;
+    }
+};
+
+/// The 4xx bodies for what the client got wrong before a handler ran. Spelled
+/// out for the same reason as `internal_error_body`.
+const bad_request_body =
+    \\{"error":{"errors":[{"reason":"invalid","location":"","debugInfo":"","message":"malformed request"}],"code":400,"message":"malformed request"}}
+;
+const too_large_body =
+    \\{"error":{"errors":[{"reason":"invalid","location":"","debugInfo":"","message":"request body too large"}],"code":413,"message":"request body too large"}}
+;
+const unsupported_encoding_body =
+    \\{"error":{"errors":[{"reason":"invalid","location":"","debugInfo":"","message":"unsupported content encoding"}],"code":415,"message":"unsupported content encoding"}}
+;
+
+/// The RFC 9110 methods plus PATCH; the router answers those it has no route for. Any other
+/// (WebDAV and the like) is a 405.
+fn methodFrom(m: dusty.Method) ?http.Method {
+    return switch (m) {
+        .get => .GET,
+        .head => .HEAD,
+        .post => .POST,
+        .put => .PUT,
+        .patch => .PATCH,
+        .delete => .DELETE,
+        .options => .OPTIONS,
+        .connect => .CONNECT,
+        .trace => .TRACE,
+        else => null,
+    };
+}
+
+/// The allow-listed headers, borrowed from the request head, which outlives
+/// the handler.
+fn headersFrom(req: *const dusty.Request) Headers {
+    return .{
+        .content_type = req.headers.get("content-type"),
+        .content_range = req.headers.get("content-range"),
+        .x_upload_content_type = req.headers.get("x-upload-content-type"),
+        .x_upload_content_length = req.headers.get("x-upload-content-length"),
+        .host = req.headers.get("host"),
+    };
 }
 
 test "queryParam parses the forms the emulator actually receives" {

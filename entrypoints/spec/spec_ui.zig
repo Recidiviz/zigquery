@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
 
     var state = State{ .records = records.items };
 
-    var server = try http_server.Server.listen(gpa, io, .{
+    const server = try http_server.Server.listen(gpa, io, .{
         .address = "127.0.0.1",
         .port = opts.port,
     }, .{ .ctx = &state, .func = dispatch, .mutex = &state.mutex, .io = io });

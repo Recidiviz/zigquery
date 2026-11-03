@@ -257,11 +257,21 @@ pub fn build(b: *std.Build) void {
     });
     const nanoarrow_c = nanoarrow_c_translator.mod;
 
+    // The HTTP/1.1 transport. Built ReleaseFast like the other vendored C
+    // (llhttp), and without TLS: clients speak cleartext to an emulator.
+    const dusty_dep = b.dependency("dusty", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+        .use_tls = false,
+    });
+    const dusty = dusty_dep.module("dusty");
+
     const server_deps: ServerDeps = .{
         .target = target,
         .cgrpc = grpc_dep.module("cgrpc"),
         .nanoarrow = nanoarrow,
         .nanoarrow_c = nanoarrow_c,
+        .dusty = dusty,
     };
 
     // The `coverage` step builds a second copy of the module tree at -ODebug,
@@ -675,12 +685,13 @@ pub fn build(b: *std.Build) void {
     b.step("grpc-smoke", "Round-trip a gRPC call against the transport skeleton")
         .dependOn(&run_grpcsmoke.step);
 
-    // Browsable UI over the spec corpus. The HTTP transport imports only std, so spec-ui links
-    // neither gRPC nor nanoarrow.
+    // Browsable UI over the spec corpus. The HTTP transport imports only std and dusty, so
+    // spec-ui links neither gRPC nor nanoarrow.
     const http_server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/http/server.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "dusty", .module = dusty }},
     });
     const spec_ui_exe = b.addExecutable(.{
         .name = "spec-ui",
@@ -944,6 +955,8 @@ const ServerDeps = struct {
     /// See the note at its construction: one instance, always ReleaseFast,
     /// shared with the coverage tree.
     cgrpc: *std.Build.Module,
+    /// The HTTP/1.1 server library behind src/server/http/server.zig.
+    dusty: *std.Build.Module,
 };
 
 fn serverModule(
@@ -966,6 +979,7 @@ fn serverModule(
             .{ .name = "zigquery", .module = engine },
             .{ .name = "cgrpc", .module = deps.cgrpc },
             .{ .name = "nanoarrow_c", .module = deps.nanoarrow_c },
+            .{ .name = "dusty", .module = deps.dusty },
         },
     });
     mod.linkLibrary(deps.nanoarrow);

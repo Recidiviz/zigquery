@@ -144,7 +144,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer app.deinit();
 
-    var server = try http_server.Server.listen(gpa, io, .{
+    const server = try http_server.Server.listen(gpa, io, .{
         .address = opts.host,
         .port = opts.port,
     }, app.handler());
