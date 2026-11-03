@@ -993,15 +993,14 @@ fn restRequest(
     arena: std.mem.Allocator,
     r: Rest,
 ) !http_server.Response {
-    var req = http_server.Request{
+    const req = http_server.Request{
         .method = r.method,
         .path = r.path,
         .query = "",
         .body = r.body,
         .arena = arena,
     };
-    const h = s.handler();
-    return h.func(h.ctx, &req);
+    return s.respondTo(&req);
 }
 
 fn newServerWithTable(arena: std.mem.Allocator) !*bqserver.Server {

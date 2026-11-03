@@ -342,6 +342,12 @@ pub const Server = struct {
         }
     }
 
+    /// Answers `req` as the REST server would, without a socket or the engine lock.
+    pub fn respondTo(s: *Server, req: *const http_server.Request) !http_server.Response {
+        if (try route_table.callMatching(s, req)) |res| return res;
+        return dispatch(s, req);
+    }
+
     /// The discovery document, naming the bind address.
     pub fn handleDiscovery(s: *Server, req: *const http_server.Request) !http_server.Response {
         return discovery.handle(req.arena, s.endpoint);
@@ -371,6 +377,11 @@ pub const Server = struct {
             .datasets_get,
             .datasets_delete,
             .datasets_patch,
+            .tables_insert,
+            .tables_list,
+            .tables_get,
+            .tables_patch,
+            .tables_delete,
             => unreachable,
             .jobs_query => s.handleQuery(req, m.captures.get(0)),
             .jobs_get_query_results => s.handleGetQueryResults(
@@ -391,27 +402,6 @@ pub const Server = struct {
                     "unsupported in this milestone: jobs.list",
                 ),
             },
-
-            .tables_insert => s.handleTablesInsert(req, m.captures.get(0), m.captures.get(1)),
-            .tables_list => s.handleTablesList(req, m.captures.get(0), m.captures.get(1)),
-            .tables_get => s.handleTablesGet(
-                req,
-                m.captures.get(0),
-                m.captures.get(1),
-                m.captures.get(2),
-            ),
-            .tables_patch => s.handleTablesPatch(
-                req,
-                m.captures.get(0),
-                m.captures.get(1),
-                m.captures.get(2),
-            ),
-            .tables_delete => s.handleTablesDelete(
-                req,
-                m.captures.get(0),
-                m.captures.get(1),
-                m.captures.get(2),
-            ),
 
             .tabledata_insert_all => s.handleTabledataInsertAll(
                 req,
@@ -794,7 +784,7 @@ pub const Server = struct {
 
     // ---- tables ----
 
-    fn handleTablesInsert(
+    pub fn handleTablesInsert(
         server: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -887,7 +877,7 @@ pub const Server = struct {
         return .{ .body = try server.tableResource(arena, table_spec) };
     }
 
-    fn handleTablesGet(
+    pub fn handleTablesGet(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -1073,7 +1063,7 @@ pub const Server = struct {
         };
     }
 
-    fn handleTablesPatch(
+    pub fn handleTablesPatch(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -1159,7 +1149,7 @@ pub const Server = struct {
         return std.json.parseFromSliceLeaky(std.json.Value, arena, sbuf.items, .{}) catch null;
     }
 
-    fn handleTablesList(
+    pub fn handleTablesList(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -1193,7 +1183,7 @@ pub const Server = struct {
         return std.mem.lessThan(u8, a.name_path[2], b.name_path[2]);
     }
 
-    fn handleTablesDelete(
+    pub fn handleTablesDelete(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -2655,8 +2645,7 @@ fn requestQuery(
         .body = body,
         .arena = arena,
     };
-    if (try route_table.callMatching(s, &req)) |res| return res;
-    return s.handler().func(s.handler().ctx, &req);
+    return s.respondTo(&req);
 }
 
 /// `jobReference.jobId` out of a jobs.insert response.
@@ -2838,7 +2827,7 @@ test "a resumable session URI names the Host the client sent, else the bind addr
         \\{"configuration":{"load":{"destinationTable":
         \\ {"projectId":"test","datasetId":"ds","tableId":"t"}}}}
     ;
-    const addressed = try s.handler().func(s.handler().ctx, &.{
+    const addressed = try s.respondTo(&.{
         .method = .POST,
         .path = "/upload/bigquery/v2/projects/test/jobs",
         .query = "uploadType=resumable",

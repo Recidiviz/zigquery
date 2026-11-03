@@ -29,6 +29,8 @@ pub const Entry = struct {
     call: Call,
 };
 
+const tables_one = "/projects/:project/datasets/:dataset/tables/:table";
+
 pub const table = [_]Entry{
     route(.GET, "/discovery/v1/apis/bigquery/v2/rest", .discovery, Server.handleDiscovery),
     route(.GET, "/$discovery/rest", .discovery, Server.handleDiscovery),
@@ -39,10 +41,16 @@ pub const table = [_]Entry{
     route(.GET, "/projects/:project/datasets/:dataset", .datasets_get, Server.handleDatasetsGet),
     route(.DELETE, "/projects/:project/datasets/:dataset", .datasets_delete, Server.handleDatasetsDelete),
     route(.PATCH, "/projects/:project/datasets/:dataset", .datasets_patch, Server.handleDatasetsPatch),
+    route(.POST, "/projects/:project/datasets/:dataset/tables", .tables_insert, Server.handleTablesInsert),
+    route(.GET, "/projects/:project/datasets/:dataset/tables", .tables_list, Server.handleTablesList),
+    route(.GET, tables_one, .tables_get, Server.handleTablesGet),
+    route(.PATCH, tables_one, .tables_patch, Server.handleTablesPatch),
+    route(.DELETE, tables_one, .tables_delete, Server.handleTablesDelete),
 };
 
 /// Every entry of `table` under each prefix it is registered at, path included.
 const registered = blk: {
+    @setEvalBranchQuota(20_000);
     const prefixes = [_][]const u8{ "", "/bigquery/v2" };
     var out: [prefixes.len * table.len]struct { path: []const u8, entry: Entry } = undefined;
     for (prefixes, 0..) |prefix, p| {
@@ -173,6 +181,7 @@ fn bind(comptime pattern: []const u8, comptime id: RouteId, comptime handler: an
 
 /// The `:name` segments of `pattern`, in order. Called at comptime.
 fn paramNames(pattern: []const u8) []const []const u8 {
+    @setEvalBranchQuota(20_000);
     var names: []const []const u8 = &.{};
     var it = std.mem.tokenizeScalar(u8, pattern, '/');
     while (it.next()) |segment| {
@@ -234,6 +243,15 @@ test "a method a path has no route for, or an unknown path, matches nothing" {
     const arena = arena_state.allocator();
     try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/debug/stats"));
     try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .GET, "/no/such/path"));
+}
+
+test "a table literally named insertAll is a table GET" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(
+        RouteId.tables_get,
+        (try matchedId(arena_state.allocator(), .GET, "/projects/p/datasets/ds/tables/insertAll")).?,
+    );
 }
 
 test "paramNames lists the bound segments in order" {

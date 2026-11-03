@@ -100,11 +100,6 @@ pub const routes = [_]Route{
     },
 
 
-    .{ .id = .tables_insert, .method = .POST, .pattern = "/projects/*/datasets/*/tables" },
-    .{ .id = .tables_list, .method = .GET, .pattern = "/projects/*/datasets/*/tables" },
-    .{ .id = .tables_get, .method = .GET, .pattern = "/projects/*/datasets/*/tables/*" },
-    .{ .id = .tables_delete, .method = .DELETE, .pattern = "/projects/*/datasets/*/tables/*" },
-    .{ .id = .tables_patch, .method = .PATCH, .pattern = "/projects/*/datasets/*/tables/*" },
 
     .{
         .id = .tabledata_insert_all,
@@ -229,11 +224,6 @@ test "insertAll sits under the table path and captures three ids" {
         match(.GET, "/projects/p/datasets/ds/tables/t/data").matched.route,
     );
 
-    // A table literally named insertAll is still a table GET, not an insert.
-    try testing.expectEqual(
-        Route.Id.tables_get,
-        match(.GET, "/projects/p/datasets/ds/tables/insertAll").matched.route,
-    );
 }
 
 test "all declared routes match their own patterns" {
