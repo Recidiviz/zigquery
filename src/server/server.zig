@@ -382,6 +382,8 @@ pub const Server = struct {
             .tables_get,
             .tables_patch,
             .tables_delete,
+            .tabledata_list,
+            .tabledata_insert_all,
             => unreachable,
             .jobs_query => s.handleQuery(req, m.captures.get(0)),
             .jobs_get_query_results => s.handleGetQueryResults(
@@ -403,18 +405,6 @@ pub const Server = struct {
                 ),
             },
 
-            .tabledata_insert_all => s.handleTabledataInsertAll(
-                req,
-                m.captures.get(0),
-                m.captures.get(1),
-                m.captures.get(2),
-            ),
-            .tabledata_list => s.handleTabledataList(
-                req,
-                m.captures.get(0),
-                m.captures.get(1),
-                m.captures.get(2),
-            ),
         };
     }
 
@@ -1216,7 +1206,7 @@ pub const Server = struct {
     /// 200 OK: batch was written; per-row errors may appear in `inserErrors`
     /// 500: internal engine failure
     /// tabledata.list: a page of a table's rows. rest/v2/tabledata/list
-    fn handleTabledataList(
+    pub fn handleTabledataList(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,
@@ -1290,7 +1280,7 @@ pub const Server = struct {
         return .{ .body = out.items };
     }
 
-    fn handleTabledataInsertAll(
+    pub fn handleTabledataInsertAll(
         s: *Server,
         req: *const http_server.Request,
         project_id: []const u8,

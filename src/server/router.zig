@@ -101,12 +101,6 @@ pub const routes = [_]Route{
 
 
 
-    .{
-        .id = .tabledata_insert_all,
-        .method = .POST,
-        .pattern = "/projects/*/datasets/*/tables/*/insertAll",
-    },
-    .{ .id = .tabledata_list, .method = .GET, .pattern = "/projects/*/datasets/*/tables/*/data" },
 };
 
 /// Go registers every handler twice: bare, and under `/bigquery/v2`
@@ -210,20 +204,6 @@ test "captures reject empty segments and extra depth" {
 test "trailing slash does not match" {
     // gorilla/mux is strict by default; a trailing slash is a different path.
     try testing.expectEqual(Outcome.not_found, match(.POST, "/projects/p/queries/"));
-}
-
-test "insertAll sits under the table path and captures three ids" {
-    const out = match(.POST, "/projects/p/datasets/ds/tables/t/insertAll");
-    try testing.expectEqual(Route.Id.tabledata_insert_all, out.matched.route);
-    try testing.expectEqualStrings("p", out.matched.captures.get(0));
-    try testing.expectEqualStrings("ds", out.matched.captures.get(1));
-    try testing.expectEqualStrings("t", out.matched.captures.get(2));
-
-    try testing.expectEqual(
-        Route.Id.tabledata_list,
-        match(.GET, "/projects/p/datasets/ds/tables/t/data").matched.route,
-    );
-
 }
 
 test "all declared routes match their own patterns" {

@@ -46,6 +46,8 @@ pub const table = [_]Entry{
     route(.GET, tables_one, .tables_get, Server.handleTablesGet),
     route(.PATCH, tables_one, .tables_patch, Server.handleTablesPatch),
     route(.DELETE, tables_one, .tables_delete, Server.handleTablesDelete),
+    route(.GET, tables_one ++ "/data", .tabledata_list, Server.handleTabledataList),
+    route(.POST, tables_one ++ "/insertAll", .tabledata_insert_all, Server.handleTabledataInsertAll),
 };
 
 /// Every entry of `table` under each prefix it is registered at, path included.
@@ -243,6 +245,20 @@ test "a method a path has no route for, or an unknown path, matches nothing" {
     const arena = arena_state.allocator();
     try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .POST, "/debug/stats"));
     try testing.expectEqual(@as(?RouteId, null), try matchedId(arena, .GET, "/no/such/path"));
+}
+
+test "insertAll and data sit under the table path" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqual(
+        RouteId.tabledata_insert_all,
+        (try matchedId(arena, .POST, "/projects/p/datasets/ds/tables/t/insertAll")).?,
+    );
+    try testing.expectEqual(
+        RouteId.tabledata_list,
+        (try matchedId(arena, .GET, "/projects/p/datasets/ds/tables/t/data")).?,
+    );
 }
 
 test "a table literally named insertAll is a table GET" {
