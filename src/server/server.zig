@@ -116,8 +116,8 @@ pub const Options = struct {
     data_from_json: []const []const u8 = &.{},
     /// Go's --dataset: one empty dataset created at startup.
     dataset: ?[]const u8 = null,
-    /// Where load jobs read gs:// sources: a Cloud Storage emulator's `host:port` or
-    /// `http://host:port`, as STORAGE_EMULATOR_HOST spells it. Null leaves gs:// loads failing.
+    /// Where load jobs read gs:// sources:
+    /// A Cloud Storage emulator's `host:port` or `http://host:port`
     storage_emulator_host: ?[]const u8 = null,
 };
 
@@ -183,11 +183,12 @@ pub const Server = struct {
 
         s.project = try arena.dupe(u8, opts.project);
         s.endpoint = try std.fmt.allocPrint(arena, "{s}:{d}", .{ opts.host, opts.port });
-        if (opts.storage_emulator_host) |host| {
+        // An empty setting, as from STORAGE_EMULATOR_HOST= in a compose file, means no emulator.
+        if (opts.storage_emulator_host) |host| if (host.len > 0) {
             s.storage_endpoint = try gcs.endpointFrom(arena, host);
             s.http_store = .{ .gpa = gpa, .io = io, .endpoint = s.storage_endpoint };
             s.storage = s.http_store.store();
-        }
+        };
 
         const store = try storage_mod.Storage.resolve(arena, opts.database);
         var failure: OpenFailure = .{};
@@ -6038,6 +6039,33 @@ test "a gs:// load with no storage configured fails the job, naming the setting"
     try testing.expectEqual(std.http.Status.ok, res.status);
     try testing.expect(std.mem.indexOf(u8, res.body, "\"errorResult\"") != null);
     try testing.expect(std.mem.indexOf(u8, res.body, "STORAGE_EMULATOR_HOST") != null);
+}
+
+test "an empty storage emulator host leaves gs:// loads failing the job" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{
+        .project = "test",
+        .dataset = "ds1",
+        .storage_emulator_host = "",
+    });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"load":{"sourceUris":["gs://staging/people.csv"],"autodetect":true,
+        \\ "destinationTable":{"projectId":"test","datasetId":"ds1","tableId":"people"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "STORAGE_EMULATOR_HOST") != null);
+}
+
+test "a real Cloud Storage host as the storage emulator stops startup" {
+    try testing.expectError(error.RealCloudStorageHost, Server.init(testing.allocator, testing.io, .{
+        .project = "test",
+        .storage_emulator_host = "https://storage.googleapis.com",
+    }));
 }
 
 test "several sources concatenate into one destination" {

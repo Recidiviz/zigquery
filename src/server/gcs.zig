@@ -108,12 +108,38 @@ pub const Uri = struct {
 
 /// Where a Cloud Storage emulator listens, as a base URL: STORAGE_EMULATOR_HOST spells it
 /// either `host:port` or `http://host:port`.
+/// Fails with error.RealCloudStorageHost when the host is set to Google's own servers,
+/// such as storage.googleapis.com
 pub fn endpointFrom(arena: std.mem.Allocator, setting: []const u8) ![]const u8 {
     const trimmed = std.mem.trimEnd(u8, setting, "/");
+    if (isGoogleHost(hostOf(trimmed))) return error.RealCloudStorageHost;
     if (std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://")) {
         return arena.dupe(u8, trimmed);
     }
     return std.fmt.allocPrint(arena, "http://{s}", .{trimmed});
+}
+
+/// The host name in a STORAGE_EMULATOR_HOST setting, without scheme, port, path or a
+/// trailing dot.
+fn hostOf(setting: []const u8) []const u8 {
+    var rest = setting;
+    if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |i| rest = rest[0..i];
+    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |i| rest = rest[i + 1 ..];
+    // A bracketed IPv6 literal has colons of its own and is never a Google name.
+    if (std.mem.startsWith(u8, rest, "[")) return rest;
+    if (std.mem.indexOfScalar(u8, rest, ':')) |i| rest = rest[0..i];
+    return std.mem.trimEnd(u8, rest, ".");
+}
+
+/// Whether host belongs to Google's API or Cloud Storage domains
+fn isGoogleHost(host: []const u8) bool {
+    for ([_][]const u8{ "googleapis.com", "cloud.google.com" }) |domain| {
+        if (std.ascii.eqlIgnoreCase(host, domain)) return true;
+        if (host.len > domain.len and host[host.len - domain.len - 1] == '.' and
+            std.ascii.eqlIgnoreCase(host[host.len - domain.len ..], domain)) return true;
+    }
+    return false;
 }
 
 /// A Cloud Storage emulator's JSON API, over HTTP. Every request has a deadline.
@@ -486,6 +512,32 @@ test "STORAGE_EMULATOR_HOST takes either spelling" {
         "http://127.0.0.1:4443",
         try endpointFrom(arena, "http://127.0.0.1:4443/"),
     );
+}
+
+test "STORAGE_EMULATOR_HOST refuses real Cloud Storage" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{
+        "storage.googleapis.com",
+        "storage.googleapis.com:443",
+        "https://storage.googleapis.com",
+        "https://storage.googleapis.com/",
+        "https://STORAGE.GoogleAPIs.com./storage/v1",
+        "https://my-bucket.storage.googleapis.com",
+        "https://storage.us-east1.rep.googleapis.com",
+        "https://www.googleapis.com",
+        "https://storage.cloud.google.com",
+    }) |real| try testing.expectError(error.RealCloudStorageHost, endpointFrom(arena, real));
+
+    for ([_][]const u8{
+        "localhost:4443",
+        "http://fake-gcs:4443",
+        "http://googleapis.com.example.test:4443",
+        "http://notgoogleapis.com:4443",
+        "http://[::1]:4443",
+    }) |emulator| _ = try endpointFrom(arena, emulator);
 }
 
 test "object names are percent-encoded into one path segment" {

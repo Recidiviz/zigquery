@@ -29,7 +29,8 @@ const usage =
     \\                          startup; repeatable, files load in order
     \\  --storage-emulator-host=<addr>
     \\                          Cloud Storage emulator that load jobs read gs://
-    \\                          sources from, as host:port or http://host:port
+    \\                          sources from, as host:port or http://host:port;
+    \\                          real Cloud Storage hosts are refused
     \\                          (default: $STORAGE_EMULATOR_HOST)
     \\  --log-level=<level>     accepted for compatibility; currently ignored
     \\  --log-format=<format>   accepted for compatibility; currently ignored
@@ -130,7 +131,16 @@ pub fn main(init: std.process.Init) !void {
         .storage_emulator_host = opts.storage_emulator_host,
     }) catch |err| switch (err) {
         error.DatabaseOpenFailed => std.process.exit(1),
-        else => return err,
+        error.RealCloudStorageHost => {
+            try err_out.print(
+                "--storage-emulator-host / STORAGE_EMULATOR_HOST points to real Cloud Storage " ++
+                    "({s}); use an emulator such as fsouza/fake-gcs-server instead\n",
+                .{opts.storage_emulator_host.?},
+            );
+            try err_out.flush();
+            std.process.exit(1);
+        },
+        else => |e| return e,
     };
     defer app.deinit();
 
