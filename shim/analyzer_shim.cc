@@ -55,6 +55,8 @@ namespace {
     // Parsed so that ALTER TABLE ADD COLUMN ... DEFAULT answers BigQuery's refusal; the driver
     // refuses a default in CREATE TABLE, which the engine does not apply.
     googlesql::FEATURE_COLUMN_DEFAULT_VALUE,
+    // ALTER TABLE RENAME COLUMN (data-definition-language.md#alter).
+    googlesql::FEATURE_ALTER_TABLE_RENAME_COLUMN,
     // Column definition list on CREATE TABLE AS SELECT (data-definition-language.md#create_table).
     googlesql::FEATURE_CREATE_TABLE_AS_SELECT_COLUMN_LIST,
     // Column name list on CREATE VIEW (data-definition-language.md#create_view).
@@ -291,7 +293,7 @@ namespace {
     googlesql::RESOLVED_DROP_FUNCTION_STMT,
     googlesql::RESOLVED_DROP_ROW_ACCESS_POLICY_STMT,
     googlesql::RESOLVED_CREATE_ROW_ACCESS_POLICY_STMT,
-    // ADD COLUMN and DROP COLUMN (data-definition-language.md#alter).
+    // ADD COLUMN, DROP COLUMN and RENAME COLUMN (data-definition-language.md#alter).
     googlesql::RESOLVED_ALTER_TABLE_STMT,
   };
 
