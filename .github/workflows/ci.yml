@@ -12,20 +12,32 @@ concurrency:
 permissions:
   contents: read
 
+# Pull requests from forks run on GitHub-hosted ubuntu-latest; same-repo
+# pull requests and pushes use the RunsOn runners. SELF_HOSTED skips the
+# RunsOn-only steps on hosted runners. runs-on and reusable-workflow inputs
+# cannot read env, so they repeat the same test inline.
+env:
+  SELF_HOSTED: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
 jobs:
   shim:
     name: shim (linux-x64)
     uses: ./.github/workflows/shim.yml
     with:
       platform: linux-x64
-      runner: runs-on=${{ github.run_id }}/runner=shim-x64/extras=s3-cache
+      runner: >-
+        ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        && format('runs-on={0}/runner=shim-x64', github.run_id) || 'ubuntu-latest' }}
+      runs_on_agent: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
   # No shim: the ephor artifact is a standalone executable that never links
   # the engine module, and build.zig only treats the shim path as a string at
   # configure time.
   analysis:
     name: ephor + fmt
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -33,6 +45,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/zig
 
@@ -56,7 +69,9 @@ jobs:
   test:
     name: unit tests
     needs: shim
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -64,6 +79,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: shim
         uses: ./.github/actions/shim
@@ -76,7 +92,9 @@ jobs:
   spec:
     name: spec (googlesqlite + go-zetasqlite)
     needs: shim
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -84,6 +102,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: shim
         uses: ./.github/actions/shim
@@ -115,7 +134,9 @@ jobs:
   concurrency-harness:
     name: concurrency harnesses
     needs: shim
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -123,6 +144,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: shim
         uses: ./.github/actions/shim
@@ -146,7 +168,9 @@ jobs:
   python-integration:
     name: python integration (Docker image)
     needs: shim
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -154,6 +178,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: shim
         uses: ./.github/actions/shim
@@ -195,7 +220,9 @@ jobs:
   node-integration:
     name: node integration (Docker image)
     needs: shim
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -203,6 +230,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: shim
         uses: ./.github/actions/shim
@@ -243,7 +271,9 @@ jobs:
   # engine, so no shim.
   gen-proto-drift:
     name: gen-proto drift
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -251,6 +281,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/zig
       - run: zig build gen-proto
@@ -272,13 +303,13 @@ jobs:
     uses: ./.github/workflows/shim.yml
     with:
       platform: linux-arm64
-      runner: runs-on=${{ github.run_id }}/runner=shim-arm64/extras=s3-cache
+      runner: runs-on=${{ github.run_id }}/runner=shim-arm64
 
   build-arm64:
     name: build (linux-arm64)
     if: github.event_name == 'push'
     needs: shim-arm64
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-arm64/extras=s3-cache
+    runs-on: runs-on=${{ github.run_id }}/runner=zig-arm64
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -286,6 +317,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: env.SELF_HOSTED == 'true'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: shim
         uses: ./.github/actions/shim

@@ -39,7 +39,10 @@ jobs:
   # the key the build job groups on has to come from a job before it.
   key:
     name: key
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    # Same runner selection as ci.yml.
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && format('runs-on={0}/runner=zig-x64', github.run_id) || 'ubuntu-latest' }}
     outputs:
       lib: ${{ steps.vars.outputs.lib }}
       static_target: ${{ steps.vars.outputs.static_target }}
@@ -54,6 +57,7 @@ jobs:
           egress-policy: audit
 
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: vars
         run: .github/scripts/shim-vars.sh "${{ inputs.platform }}"

@@ -21,14 +21,16 @@ concurrency:
 
 jobs:
   shim:
+    # Same-repo pull requests only: the job needs the pinned bench runner.
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'bench')
+      (contains(github.event.pull_request.labels.*.name, 'bench') &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     name: shim (linux-x64)
     uses: ./.github/workflows/shim.yml
     with:
       platform: linux-x64
-      runner: runs-on=${{ github.run_id }}/runner=shim-x64/extras=s3-cache
+      runner: runs-on=${{ github.run_id }}/runner=shim-x64
 
   gsql-bench:
     name: gsql-bench
@@ -36,7 +38,7 @@ jobs:
     # bench-x64 is spot:false and pinned to one instance family on purpose —
     # a run that lands on different silicon, or gets reclaimed and retried
     # elsewhere, is not comparable with the history it is charted against.
-    runs-on: runs-on=${{ github.run_id }}/runner=bench-x64/extras=s3-cache
+    runs-on: runs-on=${{ github.run_id }}/runner=bench-x64
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
