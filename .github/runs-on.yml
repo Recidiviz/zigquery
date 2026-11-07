@@ -1,12 +1,9 @@
 # RunsOn runner definitions (https://runs-on.com/docs/runners/labels/).
 #
 # Jobs reference these by name:
-#   runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+#   runs-on: runs-on=${{ github.run_id }}/runner=zig-x64
 #
-# `extras=s3-cache` routes actions/cache at the in-VPC S3 bucket instead of
-# GitHub's. Note RunsOn's own warning that the bucket is shared across
-# repositories in the stack: it is fine here because this repo is private, and
-# it must not be enabled for a runner a public repo can reach.
+# Cache extras stay off for this repository; jobs use GitHub's actions/cache.
 
 runners:
   # Everyday Zig work: compile, unit tests, spec, corpus. The shim arrives

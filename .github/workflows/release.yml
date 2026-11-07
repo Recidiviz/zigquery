@@ -19,7 +19,7 @@ env:
 jobs:
   version:
     name: resolve version
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64
     outputs:
       version: ${{ steps.v.outputs.version }}
       publish: ${{ steps.v.outputs.publish }}
@@ -62,10 +62,10 @@ jobs:
       matrix:
         include:
           - platform: linux-x64
-            runner: runs-on=${{ github.run_id }}/runner=shim-x64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=shim-x64
             runs_on_agent: true
           - platform: linux-arm64
-            runner: runs-on=${{ github.run_id }}/runner=shim-arm64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=shim-arm64
             runs_on_agent: true
           # RunsOn is Linux/Windows on EC2, so darwin builds on GitHub-hosted
           # *larger runners*: zigquery-mac-build for arm64 and
@@ -96,10 +96,10 @@ jobs:
       matrix:
         include:
           - platform: linux-x64
-            runner: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=zig-x64
             runs_on_agent: true
           - platform: linux-arm64
-            runner: runs-on=${{ github.run_id }}/runner=zig-arm64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=zig-arm64
             runs_on_agent: true
           # Same mac runners as shim-build: darwin restores from GitHub's
           # cache, which a RunsOn runner (S3-backed) cannot see.
@@ -176,10 +176,10 @@ jobs:
       matrix:
         include:
           - platform: linux-x64
-            runner: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=zig-x64
             runs_on_agent: true
           - platform: linux-arm64
-            runner: runs-on=${{ github.run_id }}/runner=zig-arm64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=zig-arm64
             runs_on_agent: true
           - platform: darwin-arm64
             runner: zigquery-mac-build
@@ -286,10 +286,10 @@ jobs:
         include:
           - platform: linux-x64
             docker_platform: linux/amd64
-            runner: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=zig-x64
           - platform: linux-arm64
             docker_platform: linux/arm64
-            runner: runs-on=${{ github.run_id }}/runner=zig-arm64/extras=s3-cache
+            runner: runs-on=${{ github.run_id }}/runner=zig-arm64
     runs-on: ${{ matrix.runner }}
     outputs:
       image: ${{ steps.meta.outputs.image }}
@@ -361,7 +361,7 @@ jobs:
     name: multi-arch manifest
     needs: [version, docker]
     if: needs.version.outputs.publish == 'true'
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -402,7 +402,7 @@ jobs:
     name: github release
     needs: [version, shim, binaries, manifest]
     if: needs.version.outputs.publish == 'true'
-    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64/extras=s3-cache
+    runs-on: runs-on=${{ github.run_id }}/runner=zig-x64
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
