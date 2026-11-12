@@ -432,7 +432,7 @@ pub const Server = struct {
         };
 
         const job_id = try query_handler.randomId(arena, &s.rng);
-        const int64_ts = q.use_int64_timestamp;
+        const ts_format = q.timestamp_format;
         const res = try query_handler.runQueryFormatted(
             arena,
             s.db,
@@ -440,7 +440,7 @@ pub const Server = struct {
             job_id,
             q.query,
             q.params,
-            int64_ts,
+            ts_format,
         );
         if (!res.ok) {
             return .{ .status = res.status, .body = res.body };
@@ -1279,7 +1279,7 @@ pub const Server = struct {
             .rows = rows,
             .total = @intCast(count.cells[0].int),
             .start = page.start,
-        }, query_handler.int64TimestampFromQuery(arena, req.query));
+        }, query_handler.timestampFormatFromQuery(arena, req.query));
         return .{ .body = out.items };
     }
 
@@ -1969,7 +1969,7 @@ pub const Server = struct {
         // being forced on. Both renderings still land in the stored ResultSet,
         // because the flag that decides between them rides on the later
         // getQueryResults call, long after this request's arena is gone.
-        const int64_ts = query_handler.int64TimestampFromQuery(arena, req.query);
+        const ts_format = query_handler.timestampFormatFromQuery(arena, req.query);
 
         // A query job may carry a destination table: this is how view
         // materialization writes results. Run the DDL form instead of the
@@ -2030,7 +2030,7 @@ pub const Server = struct {
                 job_id,
                 sql,
                 params,
-                int64_ts,
+                ts_format,
             );
         } else try query_handler.runQueryFormatted(
             arena,
@@ -2039,7 +2039,7 @@ pub const Server = struct {
             job_id,
             sql,
             params,
-            int64_ts,
+            ts_format,
         );
         s.slow_queries.record(nowSeed() -| job_t0, sql);
 
@@ -2543,7 +2543,7 @@ pub const Server = struct {
             job_id,
             job.set,
             query_handler.parseResultsPage(arena, req.query),
-            query_handler.int64TimestampFromQuery(arena, req.query),
+            query_handler.timestampFormatFromQuery(arena, req.query),
         );
         return .{ .body = out.items };
     }
@@ -3113,6 +3113,53 @@ test "getQueryResults honours formatOptions again, both ways" {
     // default and what jobs.query has always sent.
     const as_float = try requestQuery(s, arena, .GET, path, "prettyPrint=false", "");
     try testing.expectEqualStrings("1767268800.0", try onlyCell(arena, as_float.body));
+}
+
+test "timestampOutputFormat=ISO8601_STRING renders ISO 8601 on query reads" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    // jobs.query, with the option in the body: 2026-01-01 12:00:00 UTC with
+    // a half-second fraction, kept trimmed in the ISO form.
+    const queried = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT TIMESTAMP '2026-01-01 12:00:00.500000+00' AS ts",
+        \\ "formatOptions":{"timestampOutputFormat":"ISO8601_STRING"}}
+    );
+    try testing.expectEqual(std.http.Status.ok, queried.status);
+    try testing.expectEqualStrings("2026-01-01T12:00:00.5Z", try onlyCell(arena, queried.body));
+
+    // getQueryResults, with the option in the query string, on a job that
+    // was inserted without any format options.
+    const insert = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":
+        \\ "SELECT TIMESTAMP '2026-01-01 12:00:00+00' AS ts","useLegacySql":false}}}
+    );
+    const job_id = try jobIdOf(arena, insert.body);
+    const path = try std.fmt.allocPrint(arena, "/projects/test/queries/{s}", .{job_id});
+    const got = try requestQuery(
+        s,
+        arena,
+        .GET,
+        path,
+        "formatOptions.timestampOutputFormat=ISO8601_STRING&prettyPrint=false",
+        "",
+    );
+    try testing.expectEqualStrings("2026-01-01T12:00:00Z", try onlyCell(arena, got.body));
+
+    // The explicit FLOAT64 enum stands against the legacy flag.
+    const contra = try requestQuery(
+        s,
+        arena,
+        .GET,
+        path,
+        "formatOptions.useInt64Timestamp=true&formatOptions.timestampOutputFormat=FLOAT64&prettyPrint=false",
+        "",
+    );
+    try testing.expectEqualStrings("1767268800.0", try onlyCell(arena, contra.body));
 }
 
 test "maxResults pages through a result, and the token resumes it" {

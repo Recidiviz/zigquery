@@ -101,21 +101,30 @@ fn cellByteLen(cell: driver.Cell) usize {
     };
 }
 
+/// How a TIMESTAMP cell is rendered on the read endpoints: the
+/// `formatOptions.timestampOutputFormat` values, with the float-seconds
+/// form as the default. `useInt64Timestamp` is the legacy spelling of
+/// `.int64`.
+pub const TimestampFormat = enum { float64, int64, iso8601 };
+
 /// Go internal/types.Format: under `formatOptions.useInt64Timestamp`, a
 /// TIMESTAMP cell is re-rendered as int64 microseconds instead of decimal
-/// seconds.
+/// seconds. `timestampOutputFormat` selects the same rendering, or the
+/// ISO 8601 string form.
 ///
 /// Every depth, not just the top level. google-cloud-bigquery asks for this
 /// format on every read and parses a TIMESTAMP cell with `int()`, so a cell
 /// left in the float-seconds form inside a STRUCT or an ARRAY raises
 /// ValueError on the client rather than producing a wrong value.
-pub fn formatInt64Timestamps(
+pub fn formatTimestamps(
     arena: std.mem.Allocator,
     row: []const driver.Cell,
+    format: TimestampFormat,
 ) std.mem.Allocator.Error![]const driver.Cell {
+    if (format == .float64) return row;
     var converted: ?[]driver.Cell = null;
     for (row, 0..) |cell, i| {
-        const replacement = try int64Timestamp(arena, cell) orelse continue;
+        const replacement = try reformatTimestamp(arena, cell, format) orelse continue;
         if (converted == null) {
             const dup = try arena.alloc(driver.Cell, row.len);
             @memcpy(dup, row);
@@ -129,19 +138,31 @@ pub fn formatInt64Timestamps(
 /// The cell re-rendered, or null when it carries no timestamp and the original
 /// can be shared. Copying only the containers that change keeps a row of
 /// ordinary columns allocation-free.
-fn int64Timestamp(
+fn reformatTimestamp(
     arena: std.mem.Allocator,
     cell: driver.Cell,
+    format: TimestampFormat,
 ) std.mem.Allocator.Error!?driver.Cell {
     switch (cell) {
         .timestamp => |text| {
             const micros = value_mod.parseTimestampApi(text) catch return null;
-            return .{ .int = micros };
+            return switch (format) {
+                .float64 => unreachable,
+                .int64 => .{ .int = micros },
+                // TimestampValue.ToJSON: ISO 8601 with the fraction kept.
+                .iso8601 => blk: {
+                    var buf: [40]u8 = undefined;
+                    break :blk .{ .timestamp = try arena.dupe(
+                        u8,
+                        value_mod.formatTimestampJson(&buf, micros),
+                    ) };
+                },
+            };
         },
         .array => |items| {
             var out: ?[]driver.Cell = null;
             for (items, 0..) |item, i| {
-                const replacement = try int64Timestamp(arena, item) orelse continue;
+                const replacement = try reformatTimestamp(arena, item, format) orelse continue;
                 if (out == null) {
                     const dup = try arena.alloc(driver.Cell, items.len);
                     @memcpy(dup, items);
@@ -154,7 +175,7 @@ fn int64Timestamp(
         .struct_ => |fields| {
             var out: ?[]driver.Cell.Field = null;
             for (fields, 0..) |f, i| {
-                const replacement = try int64Timestamp(arena, f.value) orelse continue;
+                const replacement = try reformatTimestamp(arena, f.value, format) orelse continue;
                 if (out == null) {
                     const dup = try arena.alloc(driver.Cell.Field, fields.len);
                     @memcpy(dup, fields);
@@ -412,7 +433,7 @@ test "useInt64Timestamp reaches a TIMESTAMP inside a STRUCT" {
     var fields = [_]driver.Cell.Field{
         .{ .name = "ts", .value = .{ .timestamp = "1768003200.0" } },
     };
-    const row = try formatInt64Timestamps(arena, &.{.{ .struct_ = &fields }});
+    const row = try formatTimestamps(arena, &.{.{ .struct_ = &fields }}, .int64);
     try testing.expectEqual(@as(i64, 1768003200000000), row[0].struct_[0].value.int);
 }
 
@@ -427,7 +448,7 @@ test "useInt64Timestamp reaches a TIMESTAMP inside an ARRAY<STRUCT>" {
         .{ .name = "ts", .value = .{ .timestamp = "1768003200.0" } },
     };
     var items = [_]driver.Cell{.{ .struct_ = &fields }};
-    const row = try formatInt64Timestamps(arena, &.{.{ .array = &items }});
+    const row = try formatTimestamps(arena, &.{.{ .array = &items }}, .int64);
     try testing.expectEqual(
         @as(i64, 1768003200000000),
         row[0].array[0].struct_[0].value.int,
@@ -445,7 +466,7 @@ test "useInt64Timestamp reaches a TIMESTAMP inside a bare ARRAY" {
         .{ .timestamp = "1768003200.000005" },
         .{ .timestamp = "1768003200.500000" },
     };
-    const row = try formatInt64Timestamps(arena, &.{.{ .array = &items }});
+    const row = try formatTimestamps(arena, &.{.{ .array = &items }}, .int64);
     try testing.expectEqual(@as(i64, 1768003200000000), row[0].array[0].int);
     try testing.expectEqual(@as(i64, 1768003200000005), row[0].array[1].int);
     try testing.expectEqual(@as(i64, 1768003200500000), row[0].array[2].int);
@@ -463,7 +484,7 @@ test "a TIMESTAMP nested two containers deep is still converted" {
     var outer = [_]driver.Cell.Field{
         .{ .name = "rows", .value = .{ .array = &mid } },
     };
-    const row = try formatInt64Timestamps(arena, &.{.{ .struct_ = &outer }});
+    const row = try formatTimestamps(arena, &.{.{ .struct_ = &outer }}, .int64);
     try testing.expectEqual(
         @as(i64, 1768003200000000),
         row[0].struct_[0].value.array[0].struct_[0].value.int,
@@ -480,7 +501,7 @@ test "cells that are not timestamps are left alone" {
         .{ .name = "s", .value = .{ .string = "1768003200.0" } },
         .{ .name = "n", .value = .null },
     };
-    const row = try formatInt64Timestamps(arena, &.{ .{ .struct_ = &fields }, .{ .int = 7 } });
+    const row = try formatTimestamps(arena, &.{ .{ .struct_ = &fields }, .{ .int = 7 } }, .int64);
     try testing.expectEqualStrings("2026-01-10", row[0].struct_[0].value.date);
     // A string that merely looks like a timestamp is a string.
     try testing.expectEqualStrings("1768003200.0", row[0].struct_[1].value.string);
@@ -494,6 +515,41 @@ test "a row with no timestamp anywhere is returned unchanged" {
     const arena = arena_state.allocator();
 
     const original: []const driver.Cell = &.{ .{ .int = 1 }, .{ .string = "x" } };
-    const row = try formatInt64Timestamps(arena, original);
+    const row = try formatTimestamps(arena, original, .int64);
+    try testing.expectEqual(original.ptr, row.ptr);
+}
+
+test "iso8601 renders a TIMESTAMP as an ISO 8601 string" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const row = try formatTimestamps(arena, &.{.{ .timestamp = "1768003200.500000" }}, .iso8601);
+    try testing.expectEqualStrings("2026-01-10T00:00:00.5Z", row[0].timestamp);
+}
+
+test "iso8601 reaches a TIMESTAMP inside an ARRAY<STRUCT>" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fields = [_]driver.Cell.Field{
+        .{ .name = "ts", .value = .{ .timestamp = "1768003200.0" } },
+    };
+    var items = [_]driver.Cell{.{ .struct_ = &fields }};
+    const row = try formatTimestamps(arena, &.{.{ .array = &items }}, .iso8601);
+    try testing.expectEqualStrings(
+        "2026-01-10T00:00:00Z",
+        row[0].array[0].struct_[0].value.timestamp,
+    );
+}
+
+test "the float64 format returns a row unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const original: []const driver.Cell = &.{.{ .timestamp = "1768003200.0" }};
+    const row = try formatTimestamps(arena, original, .float64);
     try testing.expectEqual(original.ptr, row.ptr);
 }

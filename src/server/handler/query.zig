@@ -43,10 +43,12 @@ pub const QueryRequest = struct {
     /// both the body and the query string. Only getQueryResults honours it.
     /// Verified against the running Go emulator.
     max_results: ?i64 = null,
-    /// `formatOptions.useInt64Timestamp` from the body. jobs.query ORs this
-    /// with the query-string form (handler.go:2420-2424); the other two
-    /// endpoints read only the query string.
-    use_int64_timestamp: bool = false,
+    /// The `formatOptions` timestamp rendering for this request. An explicit
+    /// `timestampOutputFormat` wins over the legacy `useInt64Timestamp`;
+    /// jobs.query reads the body and ORs the legacy flag with the
+    /// query-string form (handler.go:2420-2424); the other two endpoints
+    /// read only the query string.
+    timestamp_format: response.TimestampFormat = .float64,
 };
 
 /// Reads a jobs.query request: the body, the query string, and the project id
@@ -79,9 +81,12 @@ pub fn parseRequest(
     if (q.max_results) |m| req.max_results = if (m.value) |n| @intCast(n) else null;
     // handler.go:2420-2424: the body's formatOptions OR the query string's. The
     // query string cannot reach the nested request through the http binding, so
-    // it is read on its own.
-    req.use_int64_timestamp = int64Timestamp(q.format_options) or
-        int64TimestampFromQuery(arena, query);
+    // it is read on its own. An explicit timestampOutputFormat in either place
+    // wins over the legacy flag, the body's over the query string's.
+    req.timestamp_format = timestampFormat(q.format_options) orelse
+        timestampFormatFromQueryString(arena, query) orelse
+        (if (int64Timestamp(q.format_options) or
+            int64TimestampFromQuery(arena, query)) .int64 else .float64);
     req.params = try queryparam.parseTyped(arena, q.query_parameters);
     return req;
 }
@@ -89,6 +94,41 @@ pub fn parseRequest(
 fn int64Timestamp(opts: ?*const pb.DataFormatOptions) bool {
     const o = opts orelse return false;
     return o.use_int64_timestamp orelse false;
+}
+
+/// The rendering an explicit `timestampOutputFormat` asks for, or null when
+/// it is absent or unspecified. The generated enum is non-exhaustive: an
+/// unrecognised value is treated as unspecified rather than an error.
+fn timestampFormat(opts: ?*const pb.DataFormatOptions) ?response.TimestampFormat {
+    const o = opts orelse return null;
+    return switch (o.timestamp_output_format orelse return null) {
+        .FLOAT64 => .float64,
+        .INT64 => .int64,
+        .ISO8601_STRING => .iso8601,
+        else => null,
+    };
+}
+
+/// `formatOptions.timestampOutputFormat` as a query-string parameter, which
+/// the dotted key nests back into a DataFormatOptions.
+fn timestampFormatFromQueryString(
+    arena: std.mem.Allocator,
+    query: []const u8,
+) ?response.TimestampFormat {
+    const merged = json_pb.requestValue(arena, .{ .query = query }) catch return null;
+    const q = pb.QueryRequest.jsonDecode(arena, merged, .{}) catch return null;
+    return timestampFormat(q.format_options);
+}
+
+/// The rendering a query-string-only endpoint (getQueryResults,
+/// tabledata.list) serves: an explicit `timestampOutputFormat` wins over
+/// the legacy `useInt64Timestamp` flag.
+pub fn timestampFormatFromQuery(
+    arena: std.mem.Allocator,
+    query: []const u8,
+) response.TimestampFormat {
+    if (timestampFormatFromQueryString(arena, query)) |f| return f;
+    return if (int64TimestampFromQuery(arena, query)) .int64 else .float64;
 }
 
 /// `formatOptions.useInt64Timestamp` as a query-string parameter, which the
@@ -308,7 +348,7 @@ pub const ResultSet = struct {
         set: ResultSet,
         arena: std.mem.Allocator,
         cols: []const driver.OutputColumn,
-        use_int64_timestamp: bool,
+        timestamp_format: response.TimestampFormat,
 
         /// One row, decoded and rendered.
         ///
@@ -322,21 +362,20 @@ pub const ResultSet = struct {
                 dst.* = try driver.cellFrom(r.arena, r.set.cells[i * n + col], r.set.types[col]);
             }
             const materialized = try response.materializeRow(r.arena, out, r.cols);
-            if (!r.use_int64_timestamp) return materialized;
-            return response.formatInt64Timestamps(r.arena, materialized);
+            return response.formatTimestamps(r.arena, materialized, r.timestamp_format);
         }
     };
 
     fn renderer(
         set: ResultSet,
         arena: std.mem.Allocator,
-        use_int64_timestamp: bool,
+        timestamp_format: response.TimestampFormat,
     ) !Render {
         return .{
             .set = set,
             .arena = arena,
             .cols = try set.columns(arena),
-            .use_int64_timestamp = use_int64_timestamp,
+            .timestamp_format = timestamp_format,
         };
     }
 
@@ -400,12 +439,12 @@ pub fn writeResultSet(
     job_id: []const u8,
     set: ResultSet,
     page: Page,
-    use_int64_timestamp: bool,
+    timestamp_format: response.TimestampFormat,
 ) !void {
     // Rendered here rather than at insert, and only for the rows this page
     // carries: the format options belong to *this* request, and the job that
     // ran the query could not know them.
-    const render = try set.renderer(arena, use_int64_timestamp);
+    const render = try set.renderer(arena, timestamp_format);
     const window = page.range(set.total_rows);
     const first = window.first;
     const next = window.next;
@@ -461,9 +500,9 @@ pub fn writeTableDataList(
     arena: std.mem.Allocator,
     out: *std.ArrayList(u8),
     window: TableWindow,
-    use_int64_timestamp: bool,
+    timestamp_format: response.TimestampFormat,
 ) !void {
-    const render = try window.rows.renderer(arena, use_int64_timestamp);
+    const render = try window.rows.renderer(arena, timestamp_format);
     const rows = try arena.alloc(tablerow.TableRow, window.rows.total_rows);
     for (rows, 0..) |*row, i| row.* = .{ .cells = try render.row(i) };
     const next = window.start + window.rows.total_rows;
@@ -486,7 +525,7 @@ pub fn runQuery(
     job_id: []const u8,
     sql: []const u8,
 ) !RunResult {
-    return runQueryFormatted(arena, db, project_id, job_id, sql, &.{}, false);
+    return runQueryFormatted(arena, db, project_id, job_id, sql, &.{}, .float64);
 }
 
 pub const RunResult = struct {
@@ -512,16 +551,16 @@ pub fn runQueryFormatted(
     sql: []const u8,
     /// The request's `queryParameters`, or empty.
     params: []const driver.Param,
-    /// Which rendering `body` uses. Both are built regardless whenever a
-    /// top-level TIMESTAMP column exists, so a later reader can choose.
-    want_int64_timestamps: bool,
+    /// Which rendering `body` uses. The rows are retained in storage form
+    /// regardless, so a later reader can choose its own.
+    timestamp_format: response.TimestampFormat,
 ) !RunResult {
     const collected = try collectResultSet(arena, db, sql, params);
     const set = collected.set orelse return collected;
 
     // totalBytesProcessed/Billed is the length of each rendered cell string
     var total_bytes: usize = 0;
-    const counter = try set.renderer(arena, false);
+    const counter = try set.renderer(arena, .float64);
     for (0..set.total_rows) |row| {
         total_bytes += response.renderedByteLen(try counter.row(row));
     }
@@ -535,7 +574,7 @@ pub fn runQueryFormatted(
         job_id,
         set,
         .{},
-        want_int64_timestamps,
+        timestamp_format,
     );
 
     return .{
@@ -753,7 +792,7 @@ test "a tabledata.list page carries the total and a token for the rest" {
     );
     var out: std.ArrayList(u8) = .empty;
     const window: TableWindow = .{ .rows = collected.set.?, .total = 3, .start = 1 };
-    try writeTableDataList(arena, &out, window, false);
+    try writeTableDataList(arena, &out, window, .float64);
     try testing.expectEqualStrings(
         \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"20"}]},{"f":[{"v":"30"}]}]}
     , out.items);
@@ -892,20 +931,73 @@ test "useInt64Timestamp is the body's flag OR the query string's" {
     const in_body =
         \\{"query":"SELECT 1","formatOptions":{"useInt64Timestamp":true}}
     ;
-    try testing.expectEqual(false, (try parseRequest(arena, plain, "")).use_int64_timestamp);
-    try testing.expectEqual(true, (try parseRequest(arena, in_body, "")).use_int64_timestamp);
+    try testing.expectEqual(
+        response.TimestampFormat.float64,
+        (try parseRequest(arena, plain, "")).timestamp_format,
+    );
+    try testing.expectEqual(
+        response.TimestampFormat.int64,
+        (try parseRequest(arena, in_body, "")).timestamp_format,
+    );
     // The dotted query key nests back into a DataFormatOptions. "True" is in
     // Go's ParseBool set, which the Python client sends.
-    try testing.expectEqual(true, (try parseRequest(
+    try testing.expectEqual(response.TimestampFormat.int64, (try parseRequest(
         arena,
         plain,
         "formatOptions.useInt64Timestamp=True",
-    )).use_int64_timestamp);
-    try testing.expectEqual(true, (try parseRequest(
+    )).timestamp_format);
+    try testing.expectEqual(response.TimestampFormat.int64, (try parseRequest(
         arena,
         in_body,
         "formatOptions.useInt64Timestamp=false",
-    )).use_int64_timestamp);
+    )).timestamp_format);
+}
+
+test "timestampOutputFormat wins over useInt64Timestamp, in body and query string" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const iso_body =
+        \\{"query":"SELECT 1","formatOptions":{"useInt64Timestamp":true,
+        \\ "timestampOutputFormat":"ISO8601_STRING"}}
+    ;
+    try testing.expectEqual(
+        response.TimestampFormat.iso8601,
+        (try parseRequest(arena, iso_body, "")).timestamp_format,
+    );
+
+    // The contradictory pair: the explicit enum is the forward-looking
+    // option, so FLOAT64 stands even with the legacy flag set.
+    const float_body =
+        \\{"query":"SELECT 1","formatOptions":{"useInt64Timestamp":true,
+        \\ "timestampOutputFormat":"FLOAT64"}}
+    ;
+    try testing.expectEqual(
+        response.TimestampFormat.float64,
+        (try parseRequest(arena, float_body, "")).timestamp_format,
+    );
+
+    const plain =
+        \\{"query":"SELECT 1"}
+    ;
+    try testing.expectEqual(response.TimestampFormat.iso8601, (try parseRequest(
+        arena,
+        plain,
+        "formatOptions.timestampOutputFormat=ISO8601_STRING",
+    )).timestamp_format);
+    try testing.expectEqual(response.TimestampFormat.int64, (try parseRequest(
+        arena,
+        plain,
+        "formatOptions.timestampOutputFormat=INT64",
+    )).timestamp_format);
+
+    // An unrecognised value is treated as unspecified, not an error.
+    try testing.expectEqual(response.TimestampFormat.float64, (try parseRequest(
+        arena,
+        plain,
+        "formatOptions.timestampOutputFormat=NOPE",
+    )).timestamp_format);
 }
 
 test "a getQueryResults page comes off the query string" {
