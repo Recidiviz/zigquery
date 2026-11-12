@@ -315,19 +315,32 @@ pub const Server = struct {
         const arena = req.arena;
 
         switch (router.match(req.method, req.path)) {
-            .not_found, .method_not_allowed => {
-                // Go has no 404: unmatched paths fall through to
-                // defaultHandler, which returns 500 internalError
-                // "unexpected request path: ..." (handler.go:3598-3603).
+            .not_found => {
                 return .{
-                    .status = .internal_server_error,
+                    .status = .not_found,
                     .body = try errors.body(
                         arena,
-                        .internal_error,
+                        .not_found,
                         try std.fmt.allocPrint(
                             arena,
                             "unexpected request path: {s}",
                             .{req.path},
+                        ),
+                    ),
+                };
+            },
+            .method_not_allowed => {
+                // A known path with the wrong method is a 405, as
+                // BigQuery does.
+                return .{
+                    .status = .method_not_allowed,
+                    .body = try errors.body(
+                        arena,
+                        .method_not_allowed,
+                        try std.fmt.allocPrint(
+                            arena,
+                            "unexpected request method: {s} {s}",
+                            .{ @tagName(req.method), req.path },
                         ),
                     ),
                 };
@@ -3515,7 +3528,7 @@ test "two jobs' destination tables do not collide in the shared dataset" {
     }
 }
 
-test "an unknown path is a 500, matching Go's defaultHandler" {
+test "an unknown path is a 404, not Go's 500" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3524,8 +3537,25 @@ test "an unknown path is a 500, matching Go's defaultHandler" {
     defer s.deinit();
 
     const res = try request(s, arena, .GET, "/no/such/path", "");
-    try testing.expectEqual(std.http.Status.internal_server_error, res.status);
+    try testing.expectEqual(std.http.Status.not_found, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "notFound") != null);
     try testing.expect(std.mem.indexOf(u8, res.body, "unexpected request path") != null);
+}
+
+test "a known path with the wrong method is a 405" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    // /projects/*/queries is a POST-only route, so DELETE is a method
+    // mismatch, not a missing path.
+    const res = try request(s, arena, .DELETE, "/projects/test/queries", "");
+    try testing.expectEqual(std.http.Status.method_not_allowed, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "methodNotAllowed") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "unexpected request method: DELETE /projects/test/queries") != null);
 }
 
 test "state persists across requests on the same connection" {

@@ -19,6 +19,7 @@ pub const Reason = enum {
     invalid,
     invalid_query,
     not_found,
+    method_not_allowed,
     duplicate,
     internal_error,
     backend_error,
@@ -29,6 +30,7 @@ pub const Reason = enum {
             .invalid => "invalid",
             .invalid_query => "invalidQuery",
             .not_found => "notFound",
+            .method_not_allowed => "methodNotAllowed",
             .duplicate => "duplicate",
             .internal_error => "internalError",
             .backend_error => "backendError",
@@ -39,6 +41,7 @@ pub const Reason = enum {
         return switch (r) {
             .invalid, .invalid_query => .bad_request,
             .not_found => .not_found,
+            .method_not_allowed => .method_not_allowed,
             .duplicate => .conflict,
             .internal_error, .backend_error => .internal_server_error,
         };
