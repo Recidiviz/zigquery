@@ -976,7 +976,11 @@ pub const Db = struct {
                 "Table should at least have one column.";
             return db.fail(message);
         }
-        try db.changeTableColumns(arena, path, .{ .layout = alter_columns.layout.items });
+        const layout = alter_columns.layout.items;
+        try db.changeTableColumns(arena, path, .{
+            .layout = layout,
+            .metadata = try renameMetadataFields(arena, current.metadata, current.columns, layout),
+        });
     }
 
     /// The persistent table or view registered under exactly `name_path`, or null.
@@ -1023,6 +1027,7 @@ pub const Db = struct {
             switch (action) {
                 .resolved_add_column_action_node => |action_add| try a.add(action_add),
                 .resolved_drop_column_action_node => |action_drop| try a.drop(action_drop),
+                .resolved_rename_column_action_node => |action_rename| try a.rename(action_rename),
                 else => return a.refuse("ALTER TABLE {s} is not supported", .{alterActionName(action)}),
             }
         }
@@ -1049,7 +1054,7 @@ pub const Db = struct {
         fn drop(a: *AlterColumns, action: *const pb.ResolvedDropColumnActionProto) ApplyError!void {
             const name = action.name orelse return error.TransformFailed;
             const index = a.find(name) orelse return;
-            if (try a.isLayoutColumn(name)) {
+            if (try a.isLayoutColumn(name) or try a.isKeyColumn(name)) {
                 const message = "Column `{s}` cannot be dropped in table `{s}`. Columns used in " ++
                     "table partitioning or clustering or as part of key constraints cannot be dropped.";
                 const table_id = a.table.name_path[a.table.name_path.len - 1];
@@ -1058,16 +1063,45 @@ pub const Db = struct {
             _ = a.layout.orderedRemove(index);
         }
 
-        /// Whether `name` partitions or clusters the table, or is part of its primary key, by DDL
-        /// or by the metadata API's resource.
+        /// Whether `name` partitions or clusters the table, by DDL or by the metadata API's
+        /// resource.
         fn isLayoutColumn(a: *const AlterColumns, name: []const u8) error{OutOfMemory}!bool {
             const t = a.table;
             if (t.partitioning) |partitioning| switch (partitioning) {
                 inline else => |p| if (std.ascii.eqlIgnoreCase(p.field, name)) return true,
             };
             if (containsIgnoreCase(t.clustering, name)) return true;
-            if (containsIgnoreCase(t.primary_key, name)) return true;
-            return metadataNamesColumn(a.arena, t.metadata, name);
+            return metadataNamesColumn(a.arena, t.metadata, &layout_paths, name);
+        }
+
+        /// Whether `name` is part of the table's primary key, by DDL or by the metadata API's
+        /// resource.
+        fn isKeyColumn(a: *const AlterColumns, name: []const u8) error{OutOfMemory}!bool {
+            if (containsIgnoreCase(a.table.primary_key, name)) return true;
+            return metadataNamesColumn(a.arena, a.table.metadata, &key_paths, name);
+        }
+
+        fn rename(
+            a: *AlterColumns,
+            action: *const pb.ResolvedRenameColumnActionProto,
+        ) ApplyError!void {
+            const name = action.name orelse return error.TransformFailed;
+            const new_name = action.new_name orelse return error.TransformFailed;
+            const index = a.find(name) orelse return;
+            const table_id = a.table.name_path[a.table.name_path.len - 1];
+            if (try a.isLayoutColumn(name)) {
+                const message = "Column `{s}` cannot be renamed in table `{s}`. Columns used in " ++
+                    "table partitioning or clustering cannot be renamed.";
+                return a.refuse(message, .{ name, table_id });
+            }
+            if (try a.isKeyColumn(name)) {
+                const message = "Column `{s}` used as primary key cannot be renamed in table `{s}`.";
+                return a.refuse(message, .{ name, table_id });
+            }
+            const renamed = try a.arena.create(spec.ColumnSpec);
+            renamed.* = a.layout.items[index].column.*;
+            renamed.name = new_name;
+            a.layout.items[index].column = renamed;
         }
 
         fn find(a: *const AlterColumns, name: []const u8) ?usize {
@@ -3783,24 +3817,68 @@ fn containsIgnoreCase(names: []const []const u8, name: []const u8) bool {
 fn metadataNamesColumn(
     arena: std.mem.Allocator,
     metadata: []const u8,
+    paths: []const []const []const u8,
     name: []const u8,
 ) error{OutOfMemory}!bool {
-    if (metadata.len == 0) return false;
-    const resource = std.json.parseFromSliceLeaky(std.json.Value, arena, metadata, .{}) catch |err|
-        switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return false,
-        };
-    const paths = [_][]const []const u8{
-        &.{ "timePartitioning", "field" },
-        &.{ "rangePartitioning", "field" },
-        &.{ "clustering", "fields" },
-        &.{ "tableConstraints", "primaryKey", "columns" },
-    };
+    const resource = try parseMetadata(arena, metadata) orelse return false;
     for (paths) |path| {
         if (jsonNamesColumn(jsonAt(resource, path), name)) return true;
     }
     return false;
+}
+
+/// The resource members that partition or cluster a table.
+const layout_paths = [_][]const []const u8{
+    &.{ "timePartitioning", "field" },
+    &.{ "rangePartitioning", "field" },
+    &.{ "clustering", "fields" },
+};
+
+/// The resource member that keys a table.
+const key_paths = [_][]const []const u8{
+    &.{ "tableConstraints", "primaryKey", "columns" },
+};
+
+/// A table's metadata API resource, parsed, or null when there is none or it does not parse.
+fn parseMetadata(
+    arena: std.mem.Allocator,
+    metadata: []const u8,
+) error{OutOfMemory}!?std.json.Value {
+    if (metadata.len == 0) return null;
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, metadata, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+}
+
+/// `metadata` with each top-level `schema.fields` entry named as a renamed column was renamed
+/// to its new name, so the posted description and modes follow the column; null when there is
+/// no posted schema to change.
+fn renameMetadataFields(
+    arena: std.mem.Allocator,
+    metadata: []const u8,
+    current: []const *spec.ColumnSpec,
+    layout: []const column_change.ColumnChange,
+) error{OutOfMemory}!?[]const u8 {
+    const resource = try parseMetadata(arena, metadata) orelse return null;
+    const fields = jsonAt(resource, &.{ "schema", "fields" }) orelse return null;
+    if (fields != .array) return null;
+    var renamed_any = false;
+    for (layout) |change| {
+        const from = change.from orelse continue;
+        const old_name = current[from].name;
+        if (std.mem.eql(u8, old_name, change.column.name)) continue;
+        for (fields.array.items) |*field| {
+            if (field.* != .object) continue;
+            const name = field.object.get("name") orelse continue;
+            if (name != .string or !std.mem.eql(u8, name.string, old_name)) continue;
+            try field.object.put(arena, "name", .{ .string = change.column.name });
+            renamed_any = true;
+        }
+    }
+    if (!renamed_any) return null;
+    return try std.json.Stringify.valueAlloc(arena, resource, .{});
 }
 
 fn jsonAt(root: std.json.Value, path: []const []const u8) ?std.json.Value {
