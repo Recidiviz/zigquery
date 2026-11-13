@@ -1,4 +1,4 @@
-//! CLI: zigquery [--sql] [--file <path>] [--explain] ["SELECT ..."]
+//! CLI: zigquery [--sql] [--file <path>] [--explain] [--json] ["SELECT ..."]
 //!
 //! Executes GoogleSQL against an in-memory database and prints the result rows
 //! (tab-separated, header first).
@@ -8,6 +8,13 @@
 //!              whole view graph can be recreated before the query runs
 //!   --explain  print SQLite's query plan for the final statement instead of
 //!              its rows
+//!   --json     print the rows as one JSON object instead of TSV:
+//!              {"columns": [...], "rows": [[...], ...]}. Types survive the
+//!              trip — a string stays a string, NULL stays null — so a value
+//!              containing a tab or newline cannot be mistaken for a column
+//!              boundary the way TSV can (tools/vsbq.py reads this mode;
+//!              issue #43). --stats still appends its "-- ..." lines after
+//!              the JSON document, so combine the two only when reading by eye.
 //!
 //! The --file/--explain pair is what makes a dumped view ancestry useful:
 //!
@@ -31,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
     var print_sql = false;
     var explain = false;
     var show_stats = false;
+    var json = false;
     var script_path: ?[]const u8 = null;
     var sql: ?[]const u8 = null;
     var args_it = std.process.Args.Iterator.init(init.minimal.args);
@@ -42,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
             explain = true;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             show_stats = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
         } else if (std.mem.eql(u8, arg, "--file")) {
             script_path = args_it.next() orelse {
                 try out.writeAll("error: --file needs a path\n");
@@ -55,7 +65,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (sql == null and script_path == null) {
         try out.writeAll(
-            "usage: zigquery [--sql] [--file <path>] [--stats] [--explain] [\"SELECT ...\"]\n",
+            "usage: zigquery [--sql] [--file <path>] [--stats] [--explain] [--json] " ++
+                "[\"SELECT ...\"]\n",
         );
         try out.flush();
         std.process.exit(2);
@@ -140,23 +151,47 @@ pub fn main(init: std.process.Init) !void {
     };
     defer rows.deinit();
 
-    for (rows.columns(), 0..) |name, i| {
-        if (i > 0) try out.writeAll("\t");
-        try out.print("{s}", .{name});
+    if (json) {
+        try out.writeAll("{\"columns\":[");
+        for (rows.columns(), 0..) |name, i| {
+            if (i > 0) try out.writeAll(",");
+            try std.json.Stringify.value(name, .{}, out);
+        }
+        try out.writeAll("],\"rows\":[");
+    } else {
+        for (rows.columns(), 0..) |name, i| {
+            if (i > 0) try out.writeAll("\t");
+            try out.print("{s}", .{name});
+        }
+        try out.writeAll("\n");
     }
-    try out.writeAll("\n");
 
+    var first_row = true;
     while (rows.next() catch |err| {
         try out.print("error: {s}: {s}\n", .{ @errorName(err), db.lastError() });
         try out.flush();
         std.process.exit(1);
     }) |row| {
-        for (row, 0..) |cell, i| {
-            if (i > 0) try out.writeAll("\t");
-            try printCell(out, cell);
+        if (json) {
+            if (!first_row) try out.writeAll(",");
+            first_row = false;
+            try out.writeAll("[");
         }
-        try out.writeAll("\n");
+        for (row, 0..) |cell, i| {
+            if (i > 0) try out.writeAll(if (json) "," else "\t");
+            if (json) {
+                try printJsonCell(out, cell);
+            } else {
+                try printCell(out, cell);
+            }
+        }
+        if (json) {
+            try out.writeAll("]");
+        } else {
+            try out.writeAll("\n");
+        }
     }
+    if (json) try out.writeAll("]}\n");
     if (show_stats) try printPhases(out, zigquery.phase.nowNs() -| query_start);
     try out.flush();
 }
@@ -276,6 +311,71 @@ fn printCell(out: *std.Io.Writer, cell: driver.Cell) std.Io.Writer.Error!void {
     }
 }
 
+/// The JSON spelling of one cell, for `--json`. It mirrors `printCell`'s text
+/// for the string kinds, but keeps the type: a string stays a string, NULL
+/// stays null, and a value containing a tab or newline is escaped by the JSON
+/// writer rather than splitting a row the way TSV does (issue #43). The two
+/// exceptions are deliberate, and both keep `tools/vsbq.py`'s `canon()` mapping
+/// both sides onto one spelling:
+/// - a timestamp is decimal Unix seconds, so it goes out as a JSON number —
+///   the same epoch `canon()` derives from BigQuery's native datetime;
+/// - bytes go out base64, which is the spelling `canon()` uses for them.
+fn printJsonCell(out: *std.Io.Writer, cell: driver.Cell) std.Io.Writer.Error!void {
+    switch (cell) {
+        .null => try out.writeAll("null"),
+        .int => |i| try std.json.Stringify.value(i, .{}, out),
+        .float => |f| {
+            if (std.math.isNan(f)) {
+                try out.writeAll("\"NaN\"");
+            } else if (std.math.isInf(f)) {
+                try out.writeAll(if (f > 0) "\"Infinity\"" else "\"-Infinity\"");
+            } else {
+                try std.json.Stringify.value(f, .{}, out);
+            }
+        },
+        .bool => |b| try out.writeAll(if (b) "true" else "false"),
+        .string, .date, .datetime, .time, .interval, .range => |s| {
+            try std.json.Stringify.value(s, .{}, out);
+        },
+        .timestamp => |s| {
+            // Decimal Unix seconds as a number; fall back to the raw text if
+            // it ever stops parsing, rather than failing the whole row.
+            const seconds = std.fmt.parseFloat(f64, s) catch {
+                try std.json.Stringify.value(s, .{}, out);
+                return;
+            };
+            try std.json.Stringify.value(seconds, .{}, out);
+        },
+        // A JSON column reads back as its API string, so `.json` never
+        // appears in a result row; if one ever does, the payload is already
+        // a JSON value, so it goes out as-is rather than double-encoded.
+        .json => |s| try out.writeAll(s),
+        .bytes => |b| {
+            try out.writeAll("\"");
+            try std.base64.standard.Encoder.encodeWriter(out, b);
+            try out.writeAll("\"");
+        },
+        .array => |cells| {
+            try out.writeAll("[");
+            for (cells, 0..) |c, i| {
+                if (i > 0) try out.writeAll(",");
+                try printJsonCell(out, c);
+            }
+            try out.writeAll("]");
+        },
+        .struct_ => |fields| {
+            try out.writeAll("{");
+            for (fields, 0..) |field, i| {
+                if (i > 0) try out.writeAll(",");
+                try std.json.Stringify.value(field.name, .{}, out);
+                try out.writeAll(":");
+                try printJsonCell(out, field.value);
+            }
+            try out.writeAll("}");
+        },
+    }
+}
+
 const testing = std.testing;
 
 test "replay splitting comes from the driver and survives prose" {
@@ -289,6 +389,64 @@ test "replay splitting comes from the driver and survives prose" {
         \\CREATE VIEW `c` AS /* block; comment */ SELECT 1;
         \\SELECT 2
     );
-    try testing.expectEqual(@as(usize, 5), stmts.len);
-    try testing.expectEqualStrings("SELECT 2", stmts[4]);
+    try testing.expectEqual(@as(usize, 4), stmts.len);
+    try testing.expectEqualStrings("SELECT 2", stmts[3]);
+}
+
+test "json cells keep tabs, newlines and types intact" {
+    // The bug in #43: a tab inside a value split a TSV row, so the comparator
+    // read a phantom divergence. In JSON the value is escaped, and the type
+    // survives — a string that looks like a number is still a string.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const w = &out.writer;
+
+    try printJsonCell(w, .{ .string = "a\tb\n\"q\"\\c" });
+    try w.writeAll("\n");
+    try printJsonCell(w, .null);
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .int = -7 });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .float = 1.5 });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .float = std.math.inf(f64) });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .float = std.math.nan(f64) });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .bool = true });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .string = "1e+14" });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .timestamp = "1760000000.123456" });
+    try w.writeAll("\n");
+    try printJsonCell(w, .{ .bytes = "hi" });
+    try w.writeAll("\n");
+    var arr = [_]driver.Cell{
+        .{ .int = 1 },
+        .{ .string = "x\ty" },
+    };
+    try printJsonCell(w, .{ .array = &arr });
+    try w.writeAll("\n");
+    var fields = [_]driver.Cell.Field{
+        .{ .name = "a", .value = .{ .int = 1 } },
+        .{ .name = "", .value = .{ .string = "anon" } },
+    };
+    try printJsonCell(w, .{ .struct_ = &fields });
+    try w.writeAll("\n");
+
+    try testing.expectEqualStrings(
+        \\"a\tb\n\"q\"\\c"
+        \\null
+        \\-7
+        \\1.5
+        \\"Infinity"
+        \\"NaN"
+        \\true
+        \\"1e+14"
+        \\1760000000.123456
+        \\"aGk="
+        \\[1,"x\ty"]
+        \\{"a":1,"":"anon"}
+        \\
+    , out.written());
 }

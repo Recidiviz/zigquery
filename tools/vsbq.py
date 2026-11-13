@@ -37,6 +37,7 @@ import base64
 import concurrent.futures
 import datetime
 import decimal
+import json
 import math
 import pathlib
 import re
@@ -47,6 +48,13 @@ import threading
 from google.cloud import bigquery
 
 ENGINE = "./zig-out/bin/zigquery-cli"
+# The CLI's --json mode prints one object, {"columns": [...], "rows": [[...]]},
+# with each cell typed: a string stays a string, NULL stays null, a TIMESTAMP
+# is epoch seconds as a number, bytes are base64. That is what makes a value
+# containing a tab comparable at all — the old TSV split read a tab inside a
+# value as a column boundary and flagged a divergence that did not exist
+# (issue #43). The cells are canonicalised in compare(); no container guessing
+# is needed anymore, because the JSON says which cells are containers.
 
 # `.sql = "..."` on one line, or a `\\`-prefixed multiline block.
 DESC = re.compile(r'\s*\.desc = "((?:[^"\\]|\\.)*)"')
@@ -108,10 +116,10 @@ def trim_fraction(s):
 def canon(v):
     """One canonical string for a cell, from either side.
 
-    The client returns native Python values and the CLI returns text, so each
-    kind is mapped onto whichever spelling the other already uses: a TIMESTAMP
-    onto the CLI's epoch seconds, BYTES onto its base64, and DATE / DATETIME /
-    TIME onto their ISO forms.
+    The client returns native Python values and the CLI returns JSON values,
+    so each kind is mapped onto whichever spelling the other already uses: a
+    TIMESTAMP onto the CLI's epoch seconds, BYTES onto its base64, and DATE /
+    DATETIME / TIME onto their ISO forms.
     """
     if v is None:
         return "NULL"
@@ -150,38 +158,17 @@ def canon(v):
     return f"{f:.6f}".rstrip("0").rstrip(".")
 
 
-def canon_engine_cell(s, container=False):
-    """The CLI prints containers as `[a, b]` and `{k: v}`; canon() emits them
-    without the spaces.
-
-    Whether a cell *is* a container has to be told, not guessed: the CLI's TSV
-    carries no types, and `FORMAT("[%\'d]", 1000)` produces `[1,000]`, which
-    guessing reads as a two-element array. BigQuery's side knows the schema, so
-    its value decides.
-    """
-    s = s.strip()
-    if not container:
-        return canon(s)
-    if s[:1] == "[" and s[-1:] == "]" and not re.search(r"[\[{]", s[1:-1]):
-        inner = s[1:-1].strip()
-        return "[]" if not inner else "[" + ",".join(canon(p) for p in inner.split(",")) + "]"
-    # Nested: normalise the spacing rather than splitting, which a comma inside
-    # an element would break.
-    return re.sub(r"([,:])\s+", r"\1", s)
-
-
 def run_engine(sql):
-    p = subprocess.run([ENGINE, sql], capture_output=True, text=True, timeout=180)
+    p = subprocess.run([ENGINE, "--json", sql], capture_output=True, text=True,
+                       timeout=180)
     out = (p.stdout or "") + (p.stderr or "")
     if "error:" in out:
         return None, out.strip().splitlines()[-1][:200]
-    lines = [l for l in out.split("\n") if l.strip()]
-    if not lines:
-        return [], None
-    header = lines[0].split("\t")
-    # Raw: the cells are canonicalised in compare(), where BigQuery's schema
-    # says which of them are containers.
-    return [dict(zip(header, l.split("\t"))) for l in lines[1:]], None
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError as e:
+        return None, f"bad --json output: {e}"[:200]
+    return [dict(zip(doc["columns"], row)) for row in doc["rows"]], None
 
 
 _local = threading.local()
@@ -298,7 +285,7 @@ def align(ours, theirs):
                 co[name] = ro[ko].strip()
                 ct[name] = tval.strip()
             else:
-                co[name] = canon_engine_cell(ro[ko], isinstance(tval, (list, dict)))
+                co[name] = canon(ro[ko])
                 ct[name] = canon(tval)
         out_o.append(co)
         out_t.append(ct)
@@ -312,7 +299,7 @@ def _compare(case, project):
     names_differ = False
     if not (oerr or berr):
         if len(ours) != len(theirs):
-            ours = [{k: canon_engine_cell(v) for k, v in r.items()} for r in ours]
+            ours = [{k: canon(v) for k, v in r.items()} for r in ours]
             theirs = [{k: canon(v) for k, v in r.items()} for r in theirs]
         else:
             ours, theirs, names_differ = align(ours, theirs)

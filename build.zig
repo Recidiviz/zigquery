@@ -328,7 +328,24 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = mod });
     if (maybe_bazel) |bz| unit_tests.step.dependOn(&bz.step);
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    b.step("test", "Run unit tests").dependOn(&run_unit_tests.step);
+
+    // Unit tests over the CLI module, over the same dylib-linked engine the
+    // library tests use. The CLI's test blocks otherwise run nowhere — `zig
+    // build test` only covers the library module — so they are wired into
+    // `test` here rather than left to rot.
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("entrypoints/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zigquery", .module = mod }},
+        }),
+    });
+    if (maybe_bazel) |bz| cli_tests.step.dependOn(&bz.step);
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
 
     // Conformance harness: replays testdata/specs/**.zon.
     const spec_exe = b.addExecutable(.{
