@@ -156,6 +156,7 @@ zig build server -- --project=my-project [--dataset=D] [--host=0.0.0.0] [--port=
 |----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `install-spec` | Install only `zig-out/bin/spec-runner`. Faster than `install` when you want a debug target for one spec case.                                                                                                                        |
 | `install-test` | Install the `test` and `test-server` binaries to `zig-out/tests/engine-tests` and `zig-out/tests/server-tests`, so a debugger has a stable path to attach to. These are the same artifacts the test steps run, not a second compile. |
+| `install-harness` | Install `spec-runner`, `analyzer-threads`, `shared-catalog-threads` and `grpc-smoke` to `zig-out/harness/` without running them. CI builds them once this way and runs them in other jobs. |
 | `spec-ui`      | Run the corpus and browse the results in a local web UI. `zig build spec-ui -- [--filter SUBSTR] [--dialect D] [--port N]`; the default port is 8091.                                                                                |
 
 The checked-in ZigBrains run configurations in `.run/` use `install-spec` and
