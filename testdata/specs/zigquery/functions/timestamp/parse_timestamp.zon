@@ -67,6 +67,15 @@
             },
         },
         .{
+            .desc = "parse timestamp with %E*S drops fractional digits past the microsecond",
+            // BigQuery answers 2017-01-01 13:54:59.123456 UTC, written here as epoch seconds.
+            // (recidiviz-bigquery-sandbox, 2026-11-12)
+            .sql = "SELECT PARSE_TIMESTAMP(\"%Y-%m-%dT%H:%M:%E*S%Ez\", \"2017-01-01T13:54:59.123456789012345Z\")",
+            .rows = .{
+                .{"1483278899.123456"},
+            },
+        },
+        .{
             .desc = "parse timestamp ( the year element is in different locations )",
             .sql = "SELECT PARSE_TIMESTAMP(\"%a %b %e %Y %I:%M:%S\", \"Thu Dec 25 07:30:00 2008\")",
             .expect_error = "error parsing [Thu Dec 25 07:30:00 2008] with format [%a %b %e %Y %I:%M:%S]: could not parse hour number: leading character is not a digit",

@@ -92,7 +92,7 @@ Generic `zig build` flags worth knowing:
 | `uninstall`         | Remove what `install` copied to the prefix.                                                                                                                                                                                                                                          |
 | `test`              | Engine unit tests (the `src/root.zig` module).                                                                                                                                                                                                                                       |
 | `test-server`       | Emulator unit tests (the `src/server/root.zig` module).                                                                                                                                                                                                                              |
-| `spec`              | Replay the conformance corpus under `testdata/specs/**/*.zon`. Exits nonzero on a regression against `testdata/spec_baseline.txt`; with `--strict`, on any failure.                                                                                                                  |
+| `spec`              | Replay the conformance corpus under `testdata/specs/**/*.zon`. Exits nonzero on a regression against `testdata/spec_baseline.txt`; with `--strict`, also on a failure outside `testdata/spec_known_failures.txt`.                                                                                                                  |
 | `run`               | Run the CLI (`cli`) with the arguments after `--`.                                                                                                                                                                                                                                   |
 | `server`            | Run the emulator (`bigquery-emulator`) with the arguments after `--`.                                                                                                                                                                                                                |
 
@@ -109,8 +109,15 @@ zig build spec -- [--filter SUBSTR] [--case SUBSTR]
   Together they narrow the run to one query.
 - `--strict` is what CI passes. Without it the runner only gates on regression
   against the baseline, so a case that never passed can start returning wrong
-  answers and still exit 0. `UNSUPPORTED` and `SKIP` stay non-fatal either way.
-- `--update-baseline` rewrites `testdata/spec_baseline.txt` from the current run.
+  answers and still exit 0. With it, a failing case must be listed in
+  `testdata/spec_known_failures.txt`, and a stale `unsupported_in_bigquery`
+  annotation fails the run. `UNSUPPORTED` and `SKIP` stay non-fatal either way.
+- `--update-baseline` rewrites `testdata/spec_baseline.txt` and
+  `testdata/spec_known_failures.txt` from the current run. Run it over the whole
+  corpus, without `--filter` or `--dialect`.
+- Both lists hold one case per line, as the spec path and the description
+  separated by a tab. When a description repeats within a file, the second and
+  later cases carry their ordinal as a third field.
 - `--markdown` prints a per-category table. It replays every case, so CI
   reuses the log of the plain run instead of invoking it.
 - `DUMP_SQL=<path> zig build spec` writes every statement the engine hands to

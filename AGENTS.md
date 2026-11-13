@@ -70,7 +70,8 @@ The Python client suite in `test/python` is described in `test/python/README.md`
   `src/server/proto/storage.zig` are generated; change them through `zig build gen-proto`.
 - ephor must report zero findings. Lines wrap at 100 columns, comments included; wrap at
   100, not 72 or 80.
-- `testdata/spec_baseline.txt` changes only when the issue is about the baseline itself.
+- `testdata/spec_baseline.txt` and `testdata/spec_known_failures.txt` change only when the
+  issue is about those lists themselves.
 
 ## Code style
 

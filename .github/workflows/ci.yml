@@ -93,7 +93,8 @@ jobs:
 
       # --strict is what makes this a real gate: without it the runner exits
       # nonzero only on a baseline regression, so a case that has never passed
-      # can start returning wrong answers and still go green.
+      # can start returning wrong answers and still go green. With it, a failing
+      # case has to be listed in testdata/spec_known_failures.txt.
       - name: zig build spec --strict
         run: |
           set -euo pipefail
