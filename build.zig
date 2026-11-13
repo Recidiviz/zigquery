@@ -714,6 +714,21 @@ pub fn build(b: *std.Build) void {
     dist_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     dist_step.dependOn(&b.addInstallArtifact(server_exe, .{}).step);
 
+    // ---- harnesses ----
+    //
+    // The executables behind `spec`, `analyzer-threads`, `shared-catalog-threads` and
+    // `grpc-smoke`, installed without running them, so one machine can build them and
+    // another run them. They get their own directory because `bin/` is the release tree.
+    const harness_step = b.step(
+        "install-harness",
+        "Install the spec runner and concurrency harnesses to zig-out/harness/",
+    );
+    for ([_]*std.Build.Step.Compile{ spec_exe, threads_exe, sc_threads_exe, grpcsmoke_exe }) |h| {
+        harness_step.dependOn(&b.addInstallArtifact(h, .{
+            .dest_dir = .{ .override = .{ .custom = "harness" } },
+        }).step);
+    }
+
     // ---- coverage ----
     //
     // kcov (`brew install kcov`) drives a test binary under a debugger and
