@@ -89,6 +89,7 @@ pub fn registerAll(db: *sqlite.Db, gpa: std.mem.Allocator) !*State {
     try db.createScalarFunction("zigquery_group_by", -1, state, groupByTramp, true);
     // Deterministic, as SQLite requires of a function inside a CHECK.
     try db.createScalarFunction("zigquery_required", -1, state, requiredTramp, true);
+    try db.createScalarFunction("zigquery_widen", -1, state, widenTramp, true);
 
     // Aggregate UDFs + option marker functions (Go: aggregateFuncs plus the
     // distinct/limit/order_by/ignore_nulls/having_* normalFuncs entries).
@@ -277,6 +278,49 @@ fn requiredTramp(
         }
     }
     sqlite.resultInt64(ctx, 1);
+}
+
+/// `zigquery_widen(value, position, key, member, ...)`: the stored STRUCT or ARRAY value with a
+/// member named `key` appended at each position, in argument order, for a column whose type
+/// gained trailing STRUCT fields (codec_binary.appendMember). `member` is the appended value in
+/// the binary codec, or NULL. A NULL value stays NULL.
+fn widenTramp(
+    ctx: ?*c.sqlite3_context,
+    argc: c_int,
+    argv: [*c]?*c.sqlite3_value,
+) callconv(.c) void {
+    if (argc < 1 or @rem(argc - 1, 3) != 0) {
+        sqlite.resultError(ctx, "zigquery_widen: invalid argument num");
+        return;
+    }
+    if (sqlite.valueType(argv[0]) == .null) {
+        sqlite.resultNull(ctx);
+        return;
+    }
+    const state: *State = @ptrCast(@alignCast(sqlite.userData(ctx).?));
+    _ = state.arena.reset(.retain_capacity);
+    const alloc = state.arena.allocator();
+    const widened = widen(alloc, argv[0..@intCast(argc)]) catch {
+        sqlite.resultError(ctx, "zigquery_widen: value does not match the column's type");
+        return;
+    };
+    sqlite.resultBlob(ctx, widened);
+}
+
+fn widen(alloc: std.mem.Allocator, args: []const ?*c.sqlite3_value) ![]u8 {
+    const v = try codec_binary.decodeBinaryValue(alloc, sqlite.valueBlob(args[0]));
+    var i: usize = 1;
+    while (i < args.len) : (i += 3) {
+        const position = sqlite.valueText(args[i]);
+        // SQLite's text outlives the encode below, which copies it.
+        const key = sqlite.valueText(args[i + 1]);
+        const member = if (sqlite.valueType(args[i + 2]) == .null)
+            Value.null
+        else
+            try codec_binary.decodeBinaryValue(alloc, sqlite.valueBlob(args[i + 2]));
+        try codec_binary.appendMember(alloc, v, position, key, member);
+    }
+    return codec_binary.encodeBinaryValue(alloc, v);
 }
 
 fn joinToString(alloc: std.mem.Allocator, values: []const Value) ![]u8 {

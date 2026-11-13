@@ -277,6 +277,15 @@ pub const ColumnSpec = struct {
         }
         return std.fmt.allocPrint(alloc, "`{s}` {s}", .{ self.name, typ });
     }
+
+    /// The column's definition in a CREATE TABLE or an ALTER TABLE ADD COLUMN: `sqliteSchema`,
+    /// then the CHECK for its NOT NULL STRUCT members when it has any. The CHECK is a column
+    /// constraint so that SQLite's DROP COLUMN removes it with the column.
+    pub fn declarationSql(self: *const ColumnSpec, alloc: std.mem.Allocator) Error![]u8 {
+        const schema = try self.sqliteSchema(alloc);
+        const check = try requiredCheckConstraintSQL(alloc, self) orelse return schema;
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ schema, check });
+    }
 };
 
 /// A STRUCT member declared NOT NULL, located by position so the check walks
@@ -585,15 +594,11 @@ pub const TableSpec = struct {
         });
     }
 
-    /// The column definitions and the CHECK constraints for their NOT NULL STRUCT members,
-    /// comma-joined for a `CREATE TABLE` column list.
+    /// The column definitions, comma-joined for a `CREATE TABLE` column list.
     fn declaredColumnsSql(self: *const TableSpec, alloc: std.mem.Allocator) Error![]u8 {
         var columns: std.ArrayList([]const u8) = .empty;
         for (self.columns) |c| {
-            try columns.append(alloc, try c.sqliteSchema(alloc));
-        }
-        for (self.columns) |c| {
-            if (try requiredCheckConstraintSQL(alloc, c)) |check| try columns.append(alloc, check);
+            try columns.append(alloc, try c.declarationSql(alloc));
         }
         return std.mem.join(alloc, ",", columns.items);
     }
@@ -1087,12 +1092,12 @@ test "SQLiteSchema adds one CHECK per column with NOT NULL members, positioned" 
     };
 
     try testing.expectEqualStrings(
-        "CREATE TABLE `t` (`r` TEXT,`rs` TEXT,`plain` TEXT," ++
-            "CONSTRAINT `r` CHECK (zigquery_required(`r`," ++
+        "CREATE TABLE `t` (`r` TEXT CONSTRAINT `r` CHECK (zigquery_required(`r`," ++
             "'0','Required field r.x cannot be null; error in writing field r'," ++
             "'1.0','Required field r.inner.y cannot be null; error in writing field r'))," ++
-            "CONSTRAINT `rs` CHECK (zigquery_required(`rs`," ++
-            "'[].0','Required field rs.k cannot be null; error in writing field rs')))",
+            "`rs` TEXT CONSTRAINT `rs` CHECK (zigquery_required(`rs`," ++
+            "'[].0','Required field rs.k cannot be null; error in writing field rs'))," ++
+            "`plain` TEXT)",
         try t.sqliteSchema(alloc),
     );
 }
@@ -1112,7 +1117,7 @@ test "SQLiteSchema quotes a member name's apostrophe and keeps a dotted column n
     t.* = .{ .name_path = &.{"t"}, .columns = &.{r}, .create_mode = .CREATE_DEFAULT };
 
     try testing.expectEqualStrings(
-        "CREATE TABLE `t` (`a.b` TEXT,CONSTRAINT `a.b` CHECK (zigquery_required(`a.b`," ++
+        "CREATE TABLE `t` (`a.b` TEXT CONSTRAINT `a.b` CHECK (zigquery_required(`a.b`," ++
             "'0','Required field a.b.it''s cannot be null; error in writing field a.b')))",
         try t.sqliteSchema(alloc),
     );
@@ -1146,7 +1151,7 @@ test "declaredSchemaAs names the declared columns under the given name, whatever
         .query = "SELECT STRUCT(1 AS x) AS r",
     };
     try testing.expectEqualStrings(
-        "CREATE TABLE `t` (`r` TEXT,CONSTRAINT `r` CHECK (zigquery_required(`r`," ++
+        "CREATE TABLE `t` (`r` TEXT CONSTRAINT `r` CHECK (zigquery_required(`r`," ++
             "'0','Required field r.x cannot be null; error in writing field r')))",
         try members.declaredSchemaAs(alloc, "t"),
     );
