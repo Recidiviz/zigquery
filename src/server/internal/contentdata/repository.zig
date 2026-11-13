@@ -308,7 +308,16 @@ pub const Repository = struct {
         plan: *const ColumnPlan,
     ) CellError!driver.Cell {
         if (row != .object) return .null;
-        const v = row.object.get(plan.name) orelse return .null;
+        const v = row.object.get(plan.name) orelse {
+            // Issue #114: BigQuery never stores a NULL array, so an
+            // omitted REPEATED column comes back as [], not NULL. An
+            // explicitly posted null still errors in the Normalizer
+            // below, matching Go; only the absent key is coerced here.
+            if (std.mem.eql(u8, plan.mode, "REPEATED")) {
+                return .{ .array = try r.arena.alloc(driver.Cell, 0) };
+            }
+            return .null;
+        };
 
         if (v == .string) switch (plan.coercion) {
             .timestamp => {
@@ -709,6 +718,30 @@ test "an empty REPEATED value stays empty" {
     var rows = try db.query("SELECT ARRAY_LENGTH(items) FROM `p.d.t`", &.{}, .{});
     defer rows.deinit();
     try testing.expectEqual(@as(i64, 0), (try rows.next()).?[0].int);
+}
+
+test "an omitted REPEATED column is stored as an empty array" {
+    // Issue #114: a row that never mentions a REPEATED column reads
+    // back as [], the way BigQuery stores it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var db = try driver.Db.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    try insertInto(arena, db, "CREATE TABLE `p.d.t` (`id` INT64, `items` ARRAY<STRING>)",
+        \\[{"name":"id","type":"INTEGER"},
+        \\ {"name":"items","type":"STRING","mode":"REPEATED"}]
+    ,
+        \\[{"id":1}]
+    );
+
+    var rows = try db.query("SELECT ARRAY_LENGTH(items), items IS NULL FROM `p.d.t`", &.{}, .{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try testing.expectEqual(@as(i64, 0), row[0].int);
+    try testing.expectEqual(false, row[1].bool);
 }
 
 test "a value the column will not take names its row and column, and rolls the batch back" {

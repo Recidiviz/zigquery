@@ -111,6 +111,11 @@ pub const Normalizer = struct {
                 defer _ = n.path.pop();
                 const value: driver.Cell = if (json.object.get(name)) |v|
                     try n.cellForField(v, sub)
+                else if (std.mem.eql(u8, stringOf(sub, "mode"), "REPEATED"))
+                    // Issue #114: an omitted REPEATED member of a RECORD
+                    // comes back as [], not NULL, the same rule as the
+                    // top-level absent key in the repository's cellFor.
+                    .{ .array = try n.arena.alloc(driver.Cell, 0) }
                 else
                     .null;
                 if (value == .null and std.mem.eql(u8, stringOf(sub, "mode"), "REQUIRED")) {
@@ -229,6 +234,26 @@ test "REPEATED becomes an array, and an empty one stays empty" {
     // goccy #137: an empty REPEATED value must survive as [], not null.
     const empty = try n.cellForField(try parse(arena, "[]"), field);
     try testing.expectEqual(@as(usize, 0), empty.array.len);
+}
+
+test "an omitted REPEATED member of a RECORD becomes an empty array" {
+    // Issue #114: BigQuery stores [] for a REPEATED column it never
+    // receives, so an absent member is an empty array, not NULL. An
+    // explicitly posted null still errors, as the next test pins.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var n = Normalizer{ .arena = arena };
+
+    const field = try parse(arena,
+        \\{"name":"s","type":"RECORD","fields":[
+        \\  {"name":"a","type":"INTEGER"},
+        \\  {"name":"xs","type":"STRING","mode":"REPEATED"}
+        \\]}
+    );
+    const cell = try n.cellForField(try parse(arena, "{\"a\":1}"), field);
+    try testing.expectEqual(driver.Cell{ .int = 1 }, cell.struct_[0].value);
+    try testing.expectEqual(@as(usize, 0), cell.struct_[1].value.array.len);
 }
 
 test "a non-array for a REPEATED column is Go's error" {

@@ -31,6 +31,7 @@ const catalog_mod = @import("internal/catalog.zig");
 const shared_catalog = @import("internal/shared_catalog.zig");
 const phase = @import("internal/phase.zig");
 const ast_text = @import("internal/ast_text.zig");
+const write_coerce = @import("internal/write_coerce.zig");
 
 pub const Error = error{
     Unimplemented,
@@ -2117,7 +2118,31 @@ pub const Db = struct {
                     .consumed = try db.execCreateStatement(statement, create_any, args),
                 };
             },
-            .resolved_insert_stmt_node,
+            .resolved_insert_stmt_node => |insert_stmt| {
+                const fragment = (try transformStatementFragment(db, statement)).fragment;
+                // Issue #114: a NULL array must not survive a write. The
+                // statement's own insert_column_list names the columns it
+                // writes, with their resolved types, so no catalog lookup
+                // is needed — this also covers tables (CTAS results
+                // included) whose registered spec carries no columns.
+                // Resolved before the write so a conversion failure fails
+                // the statement instead of leaving rows un-fixed.
+                const fixup_table = switch (fragment) {
+                    .insert_statement => |ins| ins.table_name,
+                    else => return error.TransformFailed,
+                };
+                const fixup_columns = try db.columnSpecsFromColumns(
+                    arena,
+                    insert_stmt.insert_column_list,
+                );
+                const changes_before = db.sqlite_db.totalChanges();
+                const consumed = try db.execSql(arena, try fragment.toString(arena), args);
+                var counts: DmlCounts = .{};
+                counts.add(fragment, db.sqlite_db.totalChanges() - changes_before);
+                // After the counts, so the fix-up does not inflate them.
+                db.coerceNullArrays(arena, fixup_table, fixup_columns);
+                return .{ .consumed = consumed, .dml = counts };
+            },
             .resolved_update_stmt_node,
             .resolved_delete_stmt_node,
             => {
@@ -2559,7 +2584,83 @@ pub const Db = struct {
             .cluster_by = ctas.cluster_by_list,
             .columns = try columnNamesFromDefinitions(arena, base.column_definition_list),
         });
-        return db.execCreateTableAction(arena, table_spec, args);
+        // Issue #114: the fix-up needs typed columns. An explicit column
+        // list already typed them; otherwise the query's output columns
+        // are the new table's schema. Resolved before the write so a
+        // conversion failure fails the statement instead of leaving rows
+        // un-fixed.
+        const fixup_columns = if (table_spec.columns.len != 0)
+            table_spec.columns
+        else
+            try db.columnSpecsFromOutput(arena, ctas.output_column_list);
+        const written = try db.execCreateTableAction(arena, table_spec, args);
+        db.coerceNullArrays(arena, try table_spec.tableName(arena), fixup_columns);
+        return written;
+    }
+
+    /// `ColumnSpec`s from a statement's resolved column list, for the
+    /// issue #114 write fix-up.
+    fn columnSpecsFromColumns(
+        db: *Db,
+        arena: std.mem.Allocator,
+        list: []const *pb.ResolvedColumnProto,
+    ) Error![]const *spec.ColumnSpec {
+        _ = db;
+        const columns = try arena.alloc(*spec.ColumnSpec, list.len);
+        for (list, columns) |col, *out| {
+            const tp = col.type orelse return error.AnalyzeFailed;
+            const c = try arena.create(spec.ColumnSpec);
+            c.* = .{
+                .name = col.name orelse "",
+                .type = spec.newTypeFromProto(arena, tp) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.AnalyzeFailed,
+                },
+            };
+            out.* = c;
+        }
+        return columns;
+    }
+
+    /// `ColumnSpec`s from a query's output columns, for the issue #114
+    /// write fix-up of a CTAS table with no explicit column list.
+    fn columnSpecsFromOutput(
+        db: *Db,
+        arena: std.mem.Allocator,
+        list: []const *pb.ResolvedOutputColumnProto,
+    ) Error![]const *spec.ColumnSpec {
+        _ = db;
+        const output_columns = try outputColumns(arena, list);
+        const columns = try arena.alloc(*spec.ColumnSpec, output_columns.len);
+        for (output_columns, columns) |oc, *out| {
+            const c = try arena.create(spec.ColumnSpec);
+            c.* = .{ .name = oc.name, .type = oc.type };
+            out.* = c;
+        }
+        return columns;
+    }
+
+    /// Issue #114: BigQuery never stores a NULL array, so after a
+    /// statement writes rows to a table, rewrite every NULL in a
+    /// REPEATED column (at any depth) to an empty array, using the
+    /// fix-ups write_coerce generates from the destination's columns.
+    /// Best-effort: the write already succeeded, so a fix-up failure is
+    /// logged, not returned.
+    fn coerceNullArrays(
+        db: *Db,
+        arena: std.mem.Allocator,
+        table_name: []const u8,
+        columns: []const *spec.ColumnSpec,
+    ) void {
+        const stmts = write_coerce.fixupStatements(arena, table_name, columns) catch |err| {
+            std.debug.print("write-coerce fix-up skipped for {s}: {t}\n", .{ table_name, err });
+            return;
+        };
+        for (stmts) |stmt| {
+            db.execSql(arena, stmt, &.{}) catch |err| {
+                std.debug.print("write-coerce fix-up failed for {s}: {t}\n", .{ table_name, err });
+            };
+        }
     }
 
     /// A CTAS whose NOT NULL columns or members must check its rows, and the SQLite table the rows
@@ -5201,6 +5302,58 @@ test "CREATE TABLE + INSERT + SELECT round-trip across foundation kinds" {
     try testing.expectEqualStrings("2023-01-15", row[4].date);
     try testing.expectEqual(@as(usize, 3), row[5].array.len);
     try testing.expectEqual(Cell{ .int = 2 }, row[5].array[1]);
+    try testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "CTAS stores a NULL array as an empty array, top-level and nested" {
+    // Issue #114: BigQuery never stores a NULL array — a NULL ARRAY
+    // written to a table reads back as [], including an array nested
+    // inside a STRUCT. In-query NULLs are untouched; only the stored
+    // form changes.
+    var db = try Db.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.exec(
+        \\CREATE TABLE ctas AS
+        \\SELECT
+        \\  CAST(NULL AS ARRAY<STRUCT<entry_num INT64, ts TIMESTAMP>>) AS arr,
+        \\  STRUCT(CAST(NULL AS ARRAY<STRUCT<entry_num INT64, ts TIMESTAMP>>) AS inner_arr) AS s
+    ,
+        &.{},
+        .{},
+    );
+
+    var rows = try db.query(
+        \\SELECT
+        \\  ARRAY_LENGTH(arr) AS arr_len, arr IS NULL AS arr_is_null,
+        \\  ARRAY_LENGTH(s.inner_arr) AS inner_len, s.inner_arr IS NULL AS inner_is_null
+        \\FROM ctas
+    ,
+        &.{},
+        .{},
+    );
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try testing.expectEqual(@as(i64, 0), row[0].int);
+    try testing.expectEqual(false, row[1].bool);
+    try testing.expectEqual(@as(i64, 0), row[2].int);
+    try testing.expectEqual(false, row[3].bool);
+    try testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+}
+
+test "INSERT INTO SELECT stores a NULL array as an empty array" {
+    // Issue #114, the INSERT path: same rule as CTAS.
+    var db = try Db.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE t_arr (arr ARRAY<INT64>)", &.{}, .{});
+    try db.exec("INSERT INTO t_arr SELECT CAST(NULL AS ARRAY<INT64>)", &.{}, .{});
+
+    var rows = try db.query("SELECT ARRAY_LENGTH(arr), arr IS NULL FROM t_arr", &.{}, .{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try testing.expectEqual(@as(i64, 0), row[0].int);
+    try testing.expectEqual(false, row[1].bool);
     try testing.expectEqual(@as(?[]const Cell, null), try rows.next());
 }
 
