@@ -1,0 +1,44 @@
+.{
+    .spec = "zigquery/functions/window/analytic_option_rejections",
+    .dialect = .zigquery,
+    .typed = true,
+    .cases = .{
+        // BigQuery refuses to plan these two combinations for the analytic
+        // function (measured on recidiviz-bigquery-sandbox, 2026-08-08, in
+        // issue #41). The GROUP BY aggregates keep both options, and other
+        // analytic aggregates keep DISTINCT (see window/distinct), so the
+        // rejection is per-function, not a blanket ban.
+        .{
+            .desc = "string_agg with distinct over a window is rejected",
+            .sql = "SELECT STRING_AGG(DISTINCT x) OVER () AS s FROM UNNEST(['a', 'b', 'a']) AS x",
+            .expect_error = "Analytic function string_agg does not support DISTINCT.",
+            .rows = .{},
+        },
+        .{
+            .desc = "array_agg with ignore nulls over a window is rejected",
+            .sql = "SELECT ARRAY_AGG(x IGNORE NULLS) OVER () AS a FROM UNNEST([1, 2, 3]) AS x",
+            .expect_error = "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+            .rows = .{},
+        },
+        // Controls: the same functions without the rejected option still work
+        // over the whole partition, one row per input row.
+        .{
+            .desc = "string_agg over a window without distinct",
+            .sql = "SELECT STRING_AGG(x) OVER () AS s FROM UNNEST(['a', 'b', 'a']) AS x",
+            .rows = .{
+                .{"a,b,a"},
+                .{"a,b,a"},
+                .{"a,b,a"},
+            },
+        },
+        .{
+            .desc = "array_agg over a window without ignore nulls",
+            .sql = "SELECT ARRAY_AGG(x) OVER () AS a FROM UNNEST([1, 2, 3]) AS x",
+            .rows = .{
+                .{.{ 1, 2, 3 }},
+                .{.{ 1, 2, 3 }},
+                .{.{ 1, 2, 3 }},
+            },
+        },
+    },
+}
