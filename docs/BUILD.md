@@ -218,8 +218,7 @@ See `docs/COVERAGE.md` before quoting a number.
 ### Harnesses with positive controls
 
 Not benchmarks, and not part of `test`: each carries a control that must fail,
-and exits nonzero when it does not, so a broken build cannot quietly pass. CI
-runs all three at `-Drelease=true`.
+and exits nonzero when it does not, so a broken build cannot quietly pass.
 
 | Step                     | Arguments                                                       | What it checks                                                                                                                                                                                                                                    |
 |--------------------------|-----------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -252,7 +251,7 @@ are not comparable.
 | Step           | Arguments                                                                                   | What it measures                                                                                                                                                                                                                  |
 |----------------|---------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `bench`        | `[queries_per_size] [catalog_sizes...]` (default 2000 over 1, 50, 500)                      | Per-query cost as a function of catalog size, with a fresh `CREATE TABLE` between timed queries so the catalog delta is never empty.                                                                                              |
-| `gsql-bench`   | `[--time MS] [--iters N] [--filter SUBSTR] [--corpus DIR] [--phases] [--markdown] [--json]` | The googlesqlite corpus vendored under `testdata/bench_corpus`, reported in the same shape as upstream's RESULTS.md. `--json` is what `bench.yml` charts; `--markdown` goes to the run summary. Default budget 1000 ms per query. |
+| `gsql-bench`   | `[--time MS] [--iters N] [--filter SUBSTR] [--corpus DIR] [--phases] [--markdown] [--json]` | The googlesqlite corpus vendored under `testdata/bench_corpus`, reported in the same shape as upstream's RESULTS.md. Default budget 1000 ms per query. |
 | `codec-bench`  | `[rows]` (default 200000)                                                                   | Value codec cost with real rows. Needs `-Dcodec-timers=true`.                                                                                                                                                                     |
 | `tz-bench`     | `[rows]` (default 200000)                                                                   | Per-row cost of named-timezone resolution, the A/B point for the ICU tzdata integration.                                                                                                                                          |
 | `load-bench`   | none                                                                                        | Whether a delete forces work proportional to catalog size. Run-only, not installed.                                                                                                                                               |

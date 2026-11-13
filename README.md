@@ -90,8 +90,7 @@ Intentional, explicit control over memory allocation improves process stability.
 
 | Workflow      | Trigger                     | What it does                                                                                                              |
 |---------------|-----------------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `ci.yml`      | PR, push                    | ephor + `zig fmt`, unit tests, the spec corpus under `--strict`, the concurrency harnesses, and a `gen-proto` drift check |
-| `bench.yml`   | push, `bench` label, manual | `gsql-bench --json` charted by github-action-benchmark on the `benchmarks` branch                                         |
+| `ci.yml`      | PR, push                    | ephor + `zig fmt`, unit tests, the spec corpus under `--strict`, and a `gen-proto` drift check                            |
 | `release.yml` | `v*.*.*` tag                | four platform tarballs, a multi-arch GHCR image, and a GitHub release                                                     |
 
 Runners are powered by [RunsOn](https://runs-on.com) on EC2 (see `.github/runs-on.yml`).
