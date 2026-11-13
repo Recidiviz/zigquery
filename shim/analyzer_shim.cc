@@ -52,6 +52,9 @@ namespace {
     googlesql::FEATURE_DECIMAL_ALIAS,
     googlesql::FEATURE_CREATE_TABLE_NOT_NULL,
     googlesql::FEATURE_CREATE_TABLE_FIELD_ANNOTATIONS,
+    // Parsed so that ALTER TABLE ADD COLUMN ... DEFAULT answers BigQuery's refusal; the driver
+    // refuses a default in CREATE TABLE, which the engine does not apply.
+    googlesql::FEATURE_COLUMN_DEFAULT_VALUE,
     // Column definition list on CREATE TABLE AS SELECT (data-definition-language.md#create_table).
     googlesql::FEATURE_CREATE_TABLE_AS_SELECT_COLUMN_LIST,
     // Column name list on CREATE VIEW (data-definition-language.md#create_view).
@@ -288,6 +291,8 @@ namespace {
     googlesql::RESOLVED_DROP_FUNCTION_STMT,
     googlesql::RESOLVED_DROP_ROW_ACCESS_POLICY_STMT,
     googlesql::RESOLVED_CREATE_ROW_ACCESS_POLICY_STMT,
+    // ADD COLUMN and DROP COLUMN (data-definition-language.md#alter).
+    googlesql::RESOLVED_ALTER_TABLE_STMT,
   };
 
   absl::Status BuildLanguageOptions(googlesql::LanguageOptions *lang) {

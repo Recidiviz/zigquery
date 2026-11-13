@@ -1,0 +1,207 @@
+// ALTER TABLE ADD COLUMN and DROP COLUMN. Every expected message is BigQuery's own
+// (recidiviz-bigquery-sandbox, 2026-11-02). The cases share one connection (no `.setup`), so each
+// sees the table the ones before it left.
+.{
+    .spec = "zigquery/syntax/ddl/alter_table",
+    .dialect = .zigquery,
+    .typed = true,
+    .cases = .{
+        .{
+            .desc = "the table: a key, a clustering column, a partitioning column and a STRUCT",
+            .sql =
+            \\CREATE TABLE at_t (a INT64 NOT NULL, b STRING, d DATE,
+            \\  r STRUCT<x INT64, y STRING NOT NULL>, PRIMARY KEY (a) NOT ENFORCED)
+            \\  PARTITION BY d CLUSTER BY b;
+            \\INSERT INTO at_t (a, b, d, r) VALUES (1, 'one', DATE '2020-01-01', STRUCT(1, 'y'))
+            ,
+            .rows = .{},
+        },
+        .{
+            .desc = "an added column reads NULL in an existing row",
+            .sql = "ALTER TABLE at_t ADD COLUMN c STRING; SELECT a, c FROM at_t",
+            .rows = .{
+                .{ 1, null },
+            },
+        },
+        .{
+            .desc = "an added ARRAY column reads empty in an existing row",
+            .sql = "ALTER TABLE at_t ADD COLUMN tags ARRAY<STRING>; SELECT ARRAY_LENGTH(tags) FROM at_t",
+            .rows = .{
+                .{0},
+            },
+        },
+        .{
+            .desc = "rows written after ADD COLUMN carry it",
+            .sql =
+            \\INSERT INTO at_t (a, c, tags) VALUES (2, 'two', ['t']);
+            \\SELECT a, c, ARRAY_LENGTH(tags) FROM at_t ORDER BY a
+            ,
+            .rows = .{
+                .{ 1, null, 0 },
+                .{ 2, "two", 1 },
+            },
+        },
+        .{
+            .desc = "adding a column that exists is an error",
+            .sql = "ALTER TABLE at_t ADD COLUMN B STRING",
+            .expect_error = "Column already exists: B",
+            .rows = .{},
+        },
+        .{
+            .desc = "IF NOT EXISTS skips a column that exists, whatever type it names",
+            .sql = "ALTER TABLE at_t ADD COLUMN IF NOT EXISTS b INT64; SELECT b FROM at_t WHERE a = 1",
+            .rows = .{
+                .{"one"},
+            },
+        },
+        .{
+            .desc = "an added column cannot be NOT NULL",
+            .sql = "ALTER TABLE at_t ADD COLUMN e STRING NOT NULL",
+            .expect_error = "Cannot add required fields to an existing schema. (field: e)",
+            .rows = .{},
+        },
+        .{
+            .desc = "an added STRUCT may have a NOT NULL member, which later rows must fill",
+            .sql =
+            \\ALTER TABLE at_t ADD COLUMN s STRUCT<p INT64 NOT NULL>;
+            \\INSERT INTO at_t (a, s) VALUES (3, STRUCT(CAST(NULL AS INT64) AS p))
+            ,
+            .expect_error = "Required field s.p cannot be null; error in writing field s",
+            .rows = .{},
+        },
+        .{
+            .desc = "one statement cannot add the same column twice",
+            .sql = "ALTER TABLE at_t ADD COLUMN m STRING, ADD COLUMN m INT64",
+            .expect_error = "Duplicate column name m in ALTER TABLE ADD COLUMN",
+            .rows = .{},
+        },
+        .{
+            .desc = "dropping a column that does not exist is an error",
+            .sql = "ALTER TABLE at_t DROP COLUMN nope",
+            .expect_error = "Column not found: nope",
+            .rows = .{},
+        },
+        .{
+            .desc = "IF EXISTS skips a column that does not exist",
+            .sql = "ALTER TABLE at_t DROP COLUMN IF EXISTS nope; SELECT COUNT(*) FROM at_t",
+            .rows = .{
+                .{2},
+            },
+        },
+        .{
+            .desc = "a partitioning column cannot be dropped",
+            .sql = "ALTER TABLE at_t DROP COLUMN d",
+            .expect_error = "Column `d` cannot be dropped in table `at_t`. Columns used in table partitioning or clustering or as part of key constraints cannot be dropped.",
+            .rows = .{},
+        },
+        .{
+            .desc = "a clustering column cannot be dropped",
+            .sql = "ALTER TABLE at_t DROP COLUMN b",
+            .expect_error = "Column `b` cannot be dropped in table `at_t`. Columns used in table partitioning or clustering or as part of key constraints cannot be dropped.",
+            .rows = .{},
+        },
+        .{
+            .desc = "a primary key column cannot be dropped",
+            .sql = "ALTER TABLE at_t DROP COLUMN a",
+            .expect_error = "Column `a` cannot be dropped in table `at_t`. Columns used in table partitioning or clustering or as part of key constraints cannot be dropped.",
+            .rows = .{},
+        },
+        .{
+            .desc = "a failing action leaves the actions before it undone",
+            .sql = "ALTER TABLE at_t ADD COLUMN mp STRING, DROP COLUMN nope",
+            .expect_error = "Column not found: nope",
+            .rows = .{},
+        },
+        .{
+            .desc = "the column the failed statement added is not there",
+            .sql = "SELECT mp FROM at_t",
+            .expect_error = "Unrecognized name: mp",
+            .rows = .{},
+        },
+        .{
+            .desc = "one statement cannot add and drop the same column",
+            .sql = "ALTER TABLE at_t ADD COLUMN ad STRING, DROP COLUMN ad",
+            .expect_error = "Column ad cannot be added and dropped by the same ALTER TABLE statement",
+            .rows = .{},
+        },
+        .{
+            .desc = "DROP COLUMN matches the name ignoring case, and the rows keep their other values",
+            .sql = "ALTER TABLE at_t DROP COLUMN C; SELECT * EXCEPT (d, r, tags, s) FROM at_t ORDER BY a",
+            .rows = .{
+                .{ 1, "one" },
+                .{ 2, null },
+            },
+        },
+        .{
+            .desc = "a dropped STRUCT column takes its NOT NULL members with it",
+            .sql = "ALTER TABLE at_t DROP COLUMN r; INSERT INTO at_t (a) VALUES (4); SELECT COUNT(*) FROM at_t",
+            .rows = .{
+                .{3},
+            },
+        },
+        .{
+            .desc = "a column dropped and added in one statement comes back empty, with its new type",
+            .sql = "ALTER TABLE at_t DROP COLUMN tags, ADD COLUMN tags INT64; SELECT tags FROM at_t WHERE a = 2",
+            .rows = .{
+                .{null},
+            },
+        },
+        .{
+            .desc = "IF EXISTS is refused on a statement that changes columns",
+            .sql = "ALTER TABLE IF EXISTS at_t ADD COLUMN q STRING",
+            .expect_error = "ALTER TABLE with schema changes does not support IF EXISTS clause",
+            .rows = .{},
+        },
+        .{
+            .desc = "the last column cannot be dropped",
+            .sql = "CREATE TABLE at_one (a INT64, b STRING); ALTER TABLE at_one DROP COLUMN a, DROP COLUMN b",
+            .expect_error = "Cannot DROP last column from the table. Table should at least have one column.",
+            .rows = .{},
+        },
+        .{
+            .desc = "a view over the table sees an added column through SELECT *",
+            .sql =
+            \\CREATE TABLE at_base (a INT64, b STRING);
+            \\INSERT INTO at_base VALUES (1, 'x');
+            \\CREATE VIEW at_star AS SELECT * FROM at_base;
+            \\CREATE VIEW at_named AS SELECT a, b FROM at_base;
+            \\ALTER TABLE at_base ADD COLUMN c STRING;
+            \\SELECT * FROM at_star
+            ,
+            .rows = .{
+                .{ 1, "x", null },
+            },
+        },
+        .{
+            .desc = "a view that names a dropped column fails when it is read, not when the column is dropped",
+            .sql = "ALTER TABLE at_base DROP COLUMN b; SELECT * FROM at_named",
+            .expect_error = "Unrecognized name: b",
+            .rows = .{},
+        },
+        .{
+            .desc = "ALTER TABLE cannot change a view's columns",
+            .sql = "ALTER TABLE at_star ADD COLUMN q STRING",
+            .expect_error = "ALTER TABLE does not support modifying the schema of a(n) VIEW: at_star",
+            .rows = .{},
+        },
+        .{
+            .desc = "an action other than ADD COLUMN or DROP COLUMN is refused by name",
+            .sql = "ALTER TABLE at_base SET OPTIONS (description = 'x')",
+            .expect_error = "ALTER TABLE SET OPTIONS is not supported",
+            .rows = .{},
+        },
+        .{
+            .desc = "an added column cannot have a default",
+            .sql = "ALTER TABLE at_base ADD COLUMN df STRING DEFAULT 'dflt'",
+            .expect_error = "Add field with default value to an existing table schema is not supported; Field: df. You can achieve the same result by executing the following 3 statements: \n1. ALTER TABLE my_table ADD COLUMN df; \n2. ALTER TABLE my_table ALTER COLUMN df SET DEFAULT 'dflt'; \n3. UPDATE my_table SET df = 'dflt' WHERE TRUE; \n",
+            .rows = .{},
+        },
+        // The engine applies no column default, so CREATE TABLE refuses one.
+        .{
+            .desc = "CREATE TABLE refuses a column default",
+            .sql = "CREATE TABLE at_default (a INT64 DEFAULT 1)",
+            .expect_error = "Column DEFAULT value is not supported.",
+            .rows = .{},
+        },
+    },
+}

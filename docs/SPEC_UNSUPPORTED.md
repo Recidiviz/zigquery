@@ -999,10 +999,7 @@ language constructs rather than functions, so each is its own project.
 **`googlesql/syntax/dcl/revoke`**
 - REVOKE SELECT removes a previously granted privilege
 
-### `googlesql/syntax/ddl` (3 cases)
-
-**`googlesql/syntax/ddl/alter_table`**
-- ALTER TABLE ADD COLUMN is accepted by the analyzer
+### `googlesql/syntax/ddl` (2 cases)
 
 **`googlesql/syntax/ddl/create_schema`**
 - CREATE SCHEMA executes without error
