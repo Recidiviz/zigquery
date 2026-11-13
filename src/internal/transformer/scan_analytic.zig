@@ -13,9 +13,50 @@ const coordinator = @import("../coordinator/coordinator.zig");
 const context = @import("../coordinator/context.zig");
 const types_data = @import("../coordinator/types_data.zig");
 const sqlbuilder = @import("../sqlbuilder/sqlbuilder.zig");
+const value_mod = @import("../value.zig");
 
 const Error = types_data.Error;
 const SQLExpression = sqlbuilder.SQLExpression;
+
+// Analytic calls BigQuery refuses to plan, by function and option. Options
+// arrive as trailing pseudo-args (zigquery_distinct, zigquery_ignore_nulls).
+// RESPECT NULLS has no pseudo-arg, so the array_agg message names it
+// alongside IGNORE NULLS. Expectations:
+// testdata/specs/zigquery/functions/window/analytic_option_rejections.zon
+
+const AnalyticOptionRejection = struct {
+    function: []const u8,
+    option: []const u8,
+    message: []const u8,
+};
+
+const analytic_option_rejections = [_]AnalyticOptionRejection{
+    .{
+        .function = "zigquery_window_string_agg",
+        .option = "zigquery_distinct",
+        .message = "Analytic function string_agg does not support DISTINCT.",
+    },
+    .{
+        .function = "zigquery_window_array_agg",
+        .option = "zigquery_ignore_nulls",
+        .message = "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+    },
+};
+
+fn checkAnalyticOptionRejections(func_data: *const types_data.ComputedColumnData) Error!void {
+    if (func_data.expression.type != .function) return;
+    const function = func_data.expression.function orelse return;
+    for (analytic_option_rejections) |rejection| {
+        if (!std.mem.eql(u8, function.name, rejection.function)) continue;
+        for (function.arguments) |arg| {
+            if (arg.type != .function) continue;
+            const arg_function = arg.function orelse continue;
+            if (!std.mem.eql(u8, arg_function.name, rejection.option)) continue;
+            value_mod.setDiagnostic("{s}", .{rejection.message});
+            return error.UnsupportedFunction;
+        }
+    }
+}
 
 pub fn transform(
     coord: *coordinator.QueryCoordinator,
@@ -36,6 +77,7 @@ pub fn transform(
     // reference inside one resolves against the input scan's columns.
     var transformed_functions = std.AutoHashMap(i64, *SQLExpression).init(alloc);
     for (analytic_data.function_list) |func_data| {
+        try checkAnalyticOptionRejections(func_data);
         const col = func_data.column orelse return error.InvalidAST;
         const expr = try coord.transformExpression(func_data.expression, ctx);
         try transformed_functions.put(col.id, expr);
@@ -189,7 +231,10 @@ test "golden SQL: DISTINCT and IGNORE NULLS become trailing pseudo-args" {
             .{},
         );
         try expectContains(stmts[0], "zigquery_window_count(`x__");
-        try expectContains(stmts[0], ", zigquery_distinct()) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)");
+        try expectContains(
+            stmts[0],
+            ", zigquery_distinct()) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+        );
     }
 
     // FIRST_VALUE(x IGNORE NULLS) OVER (ORDER BY x) -> trailing
@@ -204,4 +249,57 @@ test "golden SQL: DISTINCT and IGNORE NULLS become trailing pseudo-args" {
         try expectContains(stmts[0], "zigquery_window_first_value(`x__");
         try expectContains(stmts[0], ", zigquery_ignore_nulls()) OVER (");
     }
+}
+
+test "checkAnalyticOptionRejections" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const Case = struct {
+        function: []const u8,
+        options: []const []const u8 = &.{},
+        message: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{
+            .function = "zigquery_window_string_agg",
+            .options = &.{"zigquery_distinct"},
+            .message = "Analytic function string_agg does not support DISTINCT.",
+        },
+        .{
+            .function = "zigquery_window_array_agg",
+            .options = &.{"zigquery_ignore_nulls"},
+            .message = "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+        },
+        .{ .function = "zigquery_window_string_agg" },
+        .{ .function = "zigquery_window_array_agg", .options = &.{"zigquery_distinct"} },
+        .{ .function = "zigquery_window_sum", .options = &.{"zigquery_distinct"} },
+    };
+    for (cases) |case| {
+        var args: std.ArrayList(types_data.ExpressionData) = .empty;
+        try args.append(alloc, .{});
+        for (case.options) |option| {
+            const marker = try types_data.newFunctionCallExpressionData(alloc, option, &.{});
+            try args.append(alloc, marker);
+        }
+        const call = try types_data.newFunctionCallExpressionData(
+            alloc,
+            case.function,
+            try args.toOwnedSlice(alloc),
+        );
+        const computed = types_data.ComputedColumnData{ .expression = call };
+        if (case.message) |message| {
+            try testing.expectError(
+                error.UnsupportedFunction,
+                checkAnalyticOptionRejections(&computed),
+            );
+            try testing.expectEqualStrings(message, value_mod.diagnostic.?);
+        } else {
+            try checkAnalyticOptionRejections(&computed);
+        }
+    }
+
+    const plain = types_data.ComputedColumnData{};
+    try checkAnalyticOptionRejections(&plain);
 }

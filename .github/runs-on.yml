@@ -38,13 +38,3 @@ runners:
     family: ["c7g", "m7g"]
     image: ubuntu24-full-arm64
     volume: 200gb:gp3:750mbs:4000iops
-
-  # Benchmarks. Pinned to one instance family and spot: false — a run that
-  # lands on a different CPU, or gets interrupted and retried elsewhere, is
-  # not comparable with the history it is being charted against.
-  bench-x64:
-    cpu: 8
-    family: ["c7a"]
-    image: ubuntu24-full-x64
-    volume: 120gb:gp3:500mbs:4000iops
-    spot: false
