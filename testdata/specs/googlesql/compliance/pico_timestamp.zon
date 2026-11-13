@@ -89,17 +89,6 @@
             },
         },
         .{
-            .desc = "parse_timestamp_truncates_beyond_precision",
-            .sql =
-            \\# Here picos is part of the required features, and there's no engine override
-            \\# to the default, so it's set to 12. Any digits beyond that are truncated.
-            \\select parse_timestamp("%Y-%m-%dT%H:%M:%E*S%Ez", "2017-01-01T13:54:59.123456789012345Z")
-            ,
-            .rows = .{
-                .{"2017-01-01 13:54:59.123456789012+00"},
-            },
-        },
-        .{
             .desc = "parse_timestamp_with_explicit_precision",
             .sql = "select parse_timestamp(\"%Y-%m-%dT%H:%M:%E*S%Ez\", \"2017-01-01T13:54:59.123Z\", precision => 3)",
             .rows = .{

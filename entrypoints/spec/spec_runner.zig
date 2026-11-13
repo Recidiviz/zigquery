@@ -50,6 +50,10 @@
 //! breakpoint at the transformer and step through one case instead of 1760.
 //! See `.run/Debug spec case.run.xml`.
 //!
+//! `--update-baseline` rewrites both recorded lists from the run: the cases that must keep
+//! passing (`testdata/spec_baseline.txt`) and the cases `--strict` lets fail
+//! (`testdata/spec_known_failures.txt`).
+//!
 //! `DUMP_SQL=<path>` additionally writes the SQL snapshot (see below).
 
 const std = @import("std");
@@ -63,6 +67,7 @@ const Outcome = spec_run.Outcome;
 const Record = spec_run.Record;
 
 const baseline_path = "testdata/spec_baseline.txt";
+const known_failures_path = "testdata/spec_known_failures.txt";
 const specs_root = "testdata/specs";
 
 const Options = struct {
@@ -95,8 +100,10 @@ pub fn main(init: std.process.Init) !void {
     const opts = try parseArgs(init.minimal.args, out);
     const manifest = try spec_run.loadManifest(arena, init.io, out);
 
-    var baseline = try loadBaseline(gpa, init.io, arena);
+    var baseline = try loadKeys(gpa, init.io, arena, baseline_path);
     defer baseline.deinit(gpa);
+    var known_failures = try loadKeys(gpa, init.io, arena, known_failures_path);
+    defer known_failures.deinit(gpa);
 
     var results: std.ArrayList(Record) = .empty;
     defer results.deinit(gpa);
@@ -109,7 +116,10 @@ pub fn main(init: std.process.Init) !void {
         .filter = opts.filter,
     }, &results);
 
-    try report(out, gpa, init.io, results.items, manifest, &baseline, opts);
+    try report(out, gpa, init.io, results.items, manifest, .{
+        .baseline = &baseline,
+        .known_failures = &known_failures,
+    }, opts);
     try out.flush();
 }
 
@@ -153,12 +163,26 @@ fn parseArgs(argv: anytype, out: *std.Io.Writer) !Options {
 
 // ---- baseline & reporting ----
 
-const Baseline = std.StringHashMapUnmanaged(void);
+const KeySet = std.StringHashMapUnmanaged(void);
 
-fn loadBaseline(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator) !Baseline {
-    var map: Baseline = .empty;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, baseline_path, arena, .limited(1 << 22)) catch {
-        return map; // absent on the first run
+/// The two recorded lists the gates compare a run against, each holding case keys.
+const Recorded = struct {
+    /// Cases that must keep passing.
+    baseline: *const KeySet,
+    /// Cases --strict lets fail.
+    known_failures: *const KeySet,
+};
+
+/// The case keys listed in the file at path, one per line. A missing file reads as empty.
+fn loadKeys(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+) !KeySet {
+    var map: KeySet = .empty;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 22)) catch {
+        return map;
     };
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |line| {
@@ -174,8 +198,67 @@ fn loadBaseline(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator) !B
     return map;
 }
 
-fn key(arena: std.mem.Allocator, r: Record) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}\t{s}", .{ r.spec, r.desc });
+/// One key per result, in result order: the spec path and the case description, tab
+/// separated. A description can repeat within a file, so the second and later cases that
+/// carry it append their ordinal as a third field.
+///
+/// For example, three cases described as prepare_database in googlesql/compliance/pivot
+/// get these keys:
+///
+///     googlesql/compliance/pivot<TAB>prepare_database
+///     googlesql/compliance/pivot<TAB>prepare_database<TAB>2
+///     googlesql/compliance/pivot<TAB>prepare_database<TAB>3
+fn caseKeys(arena: std.mem.Allocator, results: []const Record) ![]const []const u8 {
+    var occurrences: std.StringHashMapUnmanaged(u32) = .empty;
+    const keys = try arena.alloc([]const u8, results.len);
+    for (results, keys) |r, *k| {
+        const first = try std.fmt.allocPrint(arena, "{s}\t{s}", .{ r.spec, r.desc });
+        const entry = try occurrences.getOrPutValue(arena, first, 0);
+        entry.value_ptr.* += 1;
+        const ordinal = entry.value_ptr.*;
+        k.* = if (ordinal == 1)
+            first
+        else
+            try std.fmt.allocPrint(arena, "{s}\t{d}", .{ first, ordinal });
+    }
+    return keys;
+}
+
+/// Writes a recorded list: a header comment, then the key of every result that keep
+/// selects, in result order.
+fn writeKeys(
+    out: *std.Io.Writer,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    comptime header: []const u8,
+    results: []const Record,
+    keys: []const []const u8,
+    comptime keep: fn (Record) bool,
+) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(
+        arena,
+        "# " ++ header ++ " Regenerate: zig build spec -- --update-baseline\n",
+    );
+    var written: u32 = 0;
+    for (results, keys) |r, k| {
+        if (!keep(r)) continue;
+        try buf.print(arena, "{s}\n", .{k});
+        written += 1;
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+    try out.print("wrote {s} ({d} entries)\n", .{ path, written });
+}
+
+// A declared unsupported_in_bigquery case that passes by matching its expected error is
+// recorded too, so the gate catches it when the error stops matching.
+fn passed(r: Record) bool {
+    return r.outcome == .pass;
+}
+
+fn failed(r: Record) bool {
+    return spec_run.bucket(r) == .fail;
 }
 
 fn report(
@@ -184,7 +267,7 @@ fn report(
     io: std.Io,
     results: []const Record,
     manifest: Manifest,
-    baseline: *Baseline,
+    recorded: Recorded,
     opts: Options,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -245,13 +328,14 @@ fn report(
         try out.writeAll("\n");
     }
 
+    const keys = try caseKeys(arena, results);
+
     // Gate: anything the baseline says passed must still pass.
     var regressions: usize = 0;
     var newly: std.ArrayList([]const u8) = .empty;
     defer newly.deinit(arena);
-    for (results) |r| {
-        const k = try key(arena, r);
-        const known = baseline.contains(k);
+    for (results, keys) |r, k| {
+        const known = recorded.baseline.contains(k);
         if (known and r.outcome != .pass) {
             regressions += 1;
             try out.print("REGRESSION {s} :: {s} :: {s} {s}\n", .{
@@ -263,23 +347,10 @@ fn report(
     }
 
     if (opts.update_baseline) {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(arena);
-        try buf.appendSlice(arena, "# Cases that must keep passing. Regenerate: zig build spec -- --update-baseline\n");
-        // Keyed on raw `outcome`, same as the regression gate above — a
-        // declared-`unsupported_in_bigquery` case that passed via
-        // `.expect_error` still belongs here, so a future regression on it
-        // (BigQuery text drifting, or the analyzer stopping matching it) is
-        // still caught. `counts.get(.pass)` (bucket-based) undercounts this
-        // set, so track the raw-pass write count separately.
-        var written: usize = 0;
-        for (results) |r| {
-            if (r.outcome != .pass) continue;
-            try buf.print(arena, "{s}\t{s}\n", .{ r.spec, r.desc });
-            written += 1;
-        }
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = baseline_path, .data = buf.items });
-        try out.print("wrote {s} ({d} entries)\n", .{ baseline_path, written });
+        const must_pass = "Cases that must keep passing.";
+        const may_fail = "Cases --strict lets fail.";
+        try writeKeys(out, arena, io, baseline_path, must_pass, results, keys, passed);
+        try writeKeys(out, arena, io, known_failures_path, may_fail, results, keys, failed);
         return;
     }
 
@@ -292,24 +363,22 @@ fn report(
         if (newly.items.len > 15) try out.print("  ... and {d} more\n", .{newly.items.len - 15});
     }
 
-    // Two gates. The baseline one is always on: whatever passed must still
-    // pass. `--strict` adds two more — a wrong answer fails the run even when
-    // the case was never in the baseline (without it, a case that flips
-    // `not_implemented` -> `fail` is silently green, because it never passed
-    // to begin with and so cannot regress), and a stale `unsupported_in_bigquery`
-    // annotation fails the run too (this engine now accepts something it
-    // claims BigQuery doesn't — a drifted fact, not a wrong answer, but just
-    // as actionable). `not_implemented` and `skip` stay non-fatal; they are
-    // the known-missing surface, not wrong answers.
-    const strict_failures = if (opts.strict) counts.get(.fail) else 0;
-    const strict_stale = if (opts.strict) stale_count else 0;
-    if (strict_failures > 0 and !opts.verbose) {
-        try out.print("\nfailing cases:\n", .{});
-        for (results) |r| {
-            if (r.outcome != .fail) continue;
+    // The baseline gate is always on. --strict adds two more. A failing case outside the
+    // known failures list fails the run, which catches a case that has never passed and
+    // so cannot regress when it moves from not_implemented to fail. A stale
+    // unsupported_in_bigquery annotation fails the run too, because the engine accepts
+    // something the annotation says BigQuery rejects. not_implemented and skip stay
+    // non-fatal.
+    var strict_failures: usize = 0;
+    if (opts.strict) {
+        for (results, keys) |r, k| {
+            if (!failed(r) or recorded.known_failures.contains(k)) continue;
+            if (strict_failures == 0) try out.print("\nfailing cases:\n", .{});
+            strict_failures += 1;
             try out.print("  FAIL {s} :: {s} :: {s}\n", .{ r.spec, r.desc, r.detail });
         }
     }
+    const strict_stale = if (opts.strict) stale_count else 0;
     if (strict_stale > 0 and !opts.verbose) {
         try out.print("\nstale unsupported_in_bigquery cases:\n", .{});
         for (results) |r| {
@@ -321,7 +390,10 @@ fn report(
     if (regressions > 0 or strict_failures > 0 or strict_stale > 0) {
         if (regressions > 0) try out.print("\n{d} regressions\n", .{regressions});
         if (strict_failures > 0) {
-            try out.print("{d} failing cases (--strict)\n", .{strict_failures});
+            try out.print(
+                "{d} failing cases outside {s} (--strict)\n",
+                .{ strict_failures, known_failures_path },
+            );
         }
         if (strict_stale > 0) {
             try out.print("{d} stale unsupported_in_bigquery cases (--strict)\n", .{strict_stale});
