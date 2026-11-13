@@ -1865,6 +1865,15 @@ pub const Server = struct {
             dst.table_id,
         );
 
+        // A schema update option the destination does not already satisfy
+        // is still refused, with the 400 parse used to answer. (#117)
+        if (!load_handler.schemaUpdateIsNoop(spec, existing)) {
+            return badRequest(
+                arena,
+                "configuration.load.schemaUpdateOptions is not supported",
+            );
+        }
+
         const unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000);
 
         // CREATE_NEVER reports a missing destination in the job result.

@@ -5,8 +5,11 @@
 //! without reading a row is settled before a job exists. docs/adr/0002
 
 const std = @import("std");
+const zigquery = @import("zigquery");
+const spec_mod = zigquery.spec;
 const gcs = @import("../gcs.zig");
 const pb = @import("../proto/bigquery.zig");
+const schema_mod = @import("../internal/types/schema.zig");
 
 /// The formats this emulator reads. The member names are the wire values.
 /// rest/v2/Job#jobconfigurationload
@@ -67,6 +70,11 @@ pub const LoadSpec = struct {
     null_marker: []const u8 = "",
     /// `configuration.load.schema`, as the client sent it.
     schema: ?*const pb.TableSchema = null,
+    /// `configuration.load.schemaUpdateOptions`, as the client sent it.
+    /// Empty when the job sets none. A load only honours them when they
+    /// change nothing against the destination; anything else is still
+    /// refused in runLoad. rest/v2/Job#jobconfigurationload
+    schema_update_options: []const []const u8 = &.{},
 
     pub fn mayCreateDestination(self: LoadSpec) bool {
         return self.create_disposition != .CREATE_NEVER;
@@ -93,9 +101,11 @@ pub const ParseError = error{
     InvalidQuote,
     /// A sourceUris entry that is not gs://bucket/object with at most one wildcard.
     InvalidSourceUri,
-    /// WRITE_TRUNCATE_DATA, or a schema update option. Each changes an existing table's
-    /// schema as a side effect.
+    /// WRITE_TRUNCATE_DATA changes an existing table's schema as a side effect.
     UnsupportedDisposition,
+    /// A schema update option BigQuery does not define. An option it does
+    /// define is carried on the spec; whether the destination already
+    /// satisfies it is settled in runLoad, not here.
     SchemaUpdateUnsupported,
     OutOfMemory,
 };
@@ -123,7 +133,11 @@ pub fn parse(job: *const pb.Job) ParseError!?LoadSpec {
     for (cfg.source_uris) |uri| {
         if (gcs.Uri.parse(uri) == null) return error.InvalidSourceUri;
     }
-    if (cfg.schema_update_options.len != 0) return error.SchemaUpdateUnsupported;
+    if (cfg.schema_update_options.len != 0) {
+        for (cfg.schema_update_options) |option| {
+            if (!isSchemaUpdateOption(option)) return error.SchemaUpdateUnsupported;
+        }
+    }
 
     const dest = cfg.destination_table orelse return error.NoDestinationTable;
 
@@ -131,11 +145,69 @@ pub fn parse(job: *const pb.Job) ParseError!?LoadSpec {
         .destination = try refFrom(dest),
         .source_uris = cfg.source_uris,
         .schema = cfg.schema,
+        .schema_update_options = cfg.schema_update_options,
     };
     try readDispositions(cfg, &spec);
     readRowOptions(cfg, &spec);
     try readCsvSyntax(cfg, &spec);
     return spec;
+}
+
+/// The two schema update options BigQuery defines on a load job.
+/// rest/v2/Job#jobconfigurationload
+fn isSchemaUpdateOption(option: []const u8) bool {
+    return std.mem.eql(u8, option, "ALLOW_FIELD_ADDITION") or
+        std.mem.eql(u8, option, "ALLOW_FIELD_RELAXATION");
+}
+
+/// Whether the schema update options on this spec change nothing against
+/// the destination as it stands: the job sets none, names no schema of its
+/// own, the destination does not exist yet, the load replaces it, or the
+/// schema the job names is the destination's, column for column. Anything
+/// else still needs the additive update #112 will add, so runLoad refuses
+/// it with the same 400 parse used to answer.
+///
+/// The comparison is over the (name, type, mode) the reader uses: a job
+/// field's wire type and mode against the catalog column's legacy type and
+/// mode, with ARRAY<T> hoisted to T REPEATED the way the REST API writes
+/// it. Nested RECORD fields are not compared — the reader ignores them
+/// too — and a relaxed mode (REQUIRED to NULLABLE) does not match: the
+/// relaxation is a schema change, not a no-op.
+pub fn schemaUpdateIsNoop(
+    load_spec: LoadSpec,
+    existing: ?*const spec_mod.TableSpec,
+) bool {
+    if (load_spec.schema_update_options.len == 0) return true;
+    if (load_spec.replacesDestination()) return true;
+    const table = existing orelse return true;
+    const schema = load_spec.schema orelse return true;
+    if (schema.fields.len != table.columns.len) return false;
+    for (schema.fields, table.columns) |field, column| {
+        if (!std.mem.eql(u8, field.name orelse "", column.name)) return false;
+        if (!std.mem.eql(u8, field.type orelse "STRING", tableTypeName(column))) {
+            return false;
+        }
+        if (!std.mem.eql(u8, field.mode orelse "NULLABLE", tableMode(column))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A catalog column's legacy type name, with ARRAY<T> hoisted to T the way
+/// the REST API writes a REPEATED field.
+fn tableTypeName(column: *const spec_mod.ColumnSpec) []const u8 {
+    const t = column.type;
+    const elem = if (t.isArray()) (t.element_type orelse t) else t;
+    return schema_mod.legacyTypeName(elem.typeKind());
+}
+
+/// A catalog column's mode: REPEATED for an ARRAY, REQUIRED for a column
+/// the catalog declared NOT NULL, NULLABLE otherwise.
+fn tableMode(column: *const spec_mod.ColumnSpec) []const u8 {
+    if (column.type.isArray()) return "REPEATED";
+    if (column.is_not_null) return "REQUIRED";
+    return "NULLABLE";
 }
 
 /// The source format, and what the job does with its destination.
@@ -412,11 +484,189 @@ test "the dispositions that change an existing table's schema are refused" {
     );
     try testing.expectError(error.UnsupportedDisposition, parse(truncate_data));
 
-    const update = try loadJob(arena,
+    const unknown_option = try loadJob(arena,
+        \\{"configuration":{"load":{"schemaUpdateOptions":["ALLOW_FIELD_DELETION"],
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expectError(error.SchemaUpdateUnsupported, parse(unknown_option));
+}
+
+test "a known schema update option is carried on the spec" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const job = try loadJob(arena,
+        \\{"configuration":{"load":{"schemaUpdateOptions":["ALLOW_FIELD_ADDITION",
+        \\ "ALLOW_FIELD_RELAXATION"],
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    const parsed = (try parse(job)).?;
+    try testing.expectEqual(@as(usize, 2), parsed.schema_update_options.len);
+    try testing.expectEqualStrings(
+        "ALLOW_FIELD_ADDITION",
+        parsed.schema_update_options[0],
+    );
+    try testing.expectEqualStrings(
+        "ALLOW_FIELD_RELAXATION",
+        parsed.schema_update_options[1],
+    );
+}
+
+/// A table with the issue's shape: id INTEGER, name STRING, both NULLABLE.
+fn tableForSchemaUpdateTest(alloc: std.mem.Allocator) !*spec_mod.TableSpec {
+    const col_id = try alloc.create(spec_mod.ColumnSpec);
+    col_id.* = .{ .name = "id", .type = try spec_mod.newSimpleType(alloc, .TYPE_INT64) };
+    const col_name = try alloc.create(spec_mod.ColumnSpec);
+    col_name.* = .{ .name = "name", .type = try spec_mod.newSimpleType(alloc, .TYPE_STRING) };
+    const table = try alloc.create(spec_mod.TableSpec);
+    table.* = .{
+        .name_path = &.{ "p", "d", "t" },
+        .columns = try alloc.dupe(*spec_mod.ColumnSpec, &.{ col_id, col_name }),
+    };
+    return table;
+}
+
+fn loadSpecWithOptions(
+    arena: std.mem.Allocator,
+    body: []const u8,
+) !LoadSpec {
+    return (try parse(try loadJob(arena, body))).?;
+}
+
+test "schema update options the destination already satisfies are a no-op" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const table = try tableForSchemaUpdateTest(arena);
+
+    // The issue's repro: the job's schema is the table's, and the option is
+    // set as a default. The load proceeds exactly as it would without it.
+    const matching = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{
+        \\ "schemaUpdateOptions":["ALLOW_FIELD_ADDITION"],
+        \\ "schema":{"fields":[
+        \\   {"name":"id","type":"INTEGER","mode":"NULLABLE"},
+        \\   {"name":"name","type":"STRING","mode":"NULLABLE"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(schemaUpdateIsNoop(matching, table));
+
+    // No options at all, no job schema, and no destination are all no-ops
+    // too: there is nothing for the options to change.
+    const no_options = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{
+        \\ "schema":{"fields":[
+        \\   {"name":"id","type":"INTEGER","mode":"NULLABLE"},
+        \\   {"name":"name","type":"STRING","mode":"NULLABLE"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(schemaUpdateIsNoop(no_options, table));
+    try testing.expect(schemaUpdateIsNoop(matching, null));
+
+    const no_schema = try loadSpecWithOptions(arena,
         \\{"configuration":{"load":{"schemaUpdateOptions":["ALLOW_FIELD_ADDITION"],
         \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
     );
-    try testing.expectError(error.SchemaUpdateUnsupported, parse(update));
+    try testing.expect(schemaUpdateIsNoop(no_schema, table));
+
+    // WRITE_TRUNCATE rebuilds the destination from the load's columns, so
+    // the options change nothing even when the schemas differ.
+    const truncate = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{"writeDisposition":"WRITE_TRUNCATE",
+        \\ "schemaUpdateOptions":["ALLOW_FIELD_ADDITION"],
+        \\ "schema":{"fields":[
+        \\   {"name":"id","type":"INTEGER","mode":"NULLABLE"},
+        \\   {"name":"name","type":"STRING","mode":"NULLABLE"},
+        \\   {"name":"extra","type":"STRING","mode":"NULLABLE"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(schemaUpdateIsNoop(truncate, table));
+}
+
+test "schema update options that would change the destination are refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const table = try tableForSchemaUpdateTest(arena);
+
+    // An added field is the additive update #112 will add, not this one.
+    const added = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{
+        \\ "schemaUpdateOptions":["ALLOW_FIELD_ADDITION"],
+        \\ "schema":{"fields":[
+        \\   {"name":"id","type":"INTEGER","mode":"NULLABLE"},
+        \\   {"name":"name","type":"STRING","mode":"NULLABLE"},
+        \\   {"name":"extra","type":"STRING","mode":"NULLABLE"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(!schemaUpdateIsNoop(added, table));
+
+    // A retyped column is a schema change too.
+    const retyped = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{
+        \\ "schemaUpdateOptions":["ALLOW_FIELD_ADDITION"],
+        \\ "schema":{"fields":[
+        \\   {"name":"id","type":"STRING","mode":"NULLABLE"},
+        \\   {"name":"name","type":"STRING","mode":"NULLABLE"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(!schemaUpdateIsNoop(retyped, table));
+
+    // A relaxed mode is a schema change, not a no-op, even though the
+    // reader would read the same columns either way. The table holds id
+    // REQUIRED; the job asks for it NULLABLE.
+    const required_id = try arena.create(spec_mod.ColumnSpec);
+    required_id.* = .{
+        .name = "id",
+        .type = try spec_mod.newSimpleType(arena, .TYPE_INT64),
+        .is_not_null = true,
+    };
+    const required_name = try arena.create(spec_mod.ColumnSpec);
+    required_name.* = .{
+        .name = "name",
+        .type = try spec_mod.newSimpleType(arena, .TYPE_STRING),
+    };
+    const required_table = try arena.create(spec_mod.TableSpec);
+    required_table.* = .{
+        .name_path = &.{ "p", "d", "t" },
+        .columns = try arena.dupe(*spec_mod.ColumnSpec, &.{ required_id, required_name }),
+    };
+    const relaxed = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{
+        \\ "schemaUpdateOptions":["ALLOW_FIELD_RELAXATION"],
+        \\ "schema":{"fields":[
+        \\   {"name":"id","type":"INTEGER","mode":"NULLABLE"},
+        \\   {"name":"name","type":"STRING","mode":"NULLABLE"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(!schemaUpdateIsNoop(relaxed, required_table));
+}
+
+test "a repeated column matches a REPEATED field" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const elem = try spec_mod.newSimpleType(arena, .TYPE_INT64);
+    const arr = try spec_mod.newSimpleType(arena, .TYPE_ARRAY);
+    arr.element_type = elem;
+    const col = try arena.create(spec_mod.ColumnSpec);
+    col.* = .{ .name = "ids", .type = arr };
+    const table = try arena.create(spec_mod.TableSpec);
+    table.* = .{
+        .name_path = &.{ "p", "d", "t" },
+        .columns = try arena.dupe(*spec_mod.ColumnSpec, &.{col}),
+    };
+
+    const repeated = try loadSpecWithOptions(arena,
+        \\{"configuration":{"load":{
+        \\ "schemaUpdateOptions":["ALLOW_FIELD_ADDITION"],
+        \\ "schema":{"fields":[
+        \\   {"name":"ids","type":"INTEGER","mode":"REPEATED"}]},
+        \\ "destinationTable":{"projectId":"p","datasetId":"d","tableId":"t"}}}}
+    );
+    try testing.expect(schemaUpdateIsNoop(repeated, table));
 }
 
 test "only WRITE_TRUNCATE replaces the destination's rows" {

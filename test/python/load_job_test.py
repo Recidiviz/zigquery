@@ -244,6 +244,69 @@ class TestLoadJobs(BigQueryEmulatorTestCase):
         # The emulator's own refusal, rather than anything the client decided locally.
         self.assertIn("sourceFormat", str(caught.exception))
 
+    # ---- schema update options ----
+
+    def test_schema_update_options_are_accepted_when_the_schema_matches(self) -> None:
+        """The issue's first step (#117): clients that set ALLOW_FIELD_ADDITION
+        as a default are unblocked when the job's schema is the table's, so
+        the option changes nothing."""
+        table = bigquery.Table(
+            self._table_ref("matched"),
+            schema=[
+                SchemaField("id", "INTEGER"),
+                SchemaField("name", "STRING"),
+            ],
+        )
+        self.client.create_table(table)
+
+        job = self._load(
+            "matched",
+            "1,Alice\n",
+            schema=[
+                SchemaField("id", "INTEGER"),
+                SchemaField("name", "STRING"),
+            ],
+            schema_update_options=[
+                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+            ],
+            skip_leading_rows=0,
+        )
+        self.assertIsNone(job.error_result)
+        self.assertEqual([{"id": 1, "name": "Alice"}], self._rows("matched"))
+
+    def test_schema_update_options_are_refused_when_the_schema_would_change(self) -> None:
+        """An added field is the additive update #112 will add, not this one:
+        the load is still refused with the same 400."""
+        table = bigquery.Table(
+            self._table_ref("unmatched"),
+            schema=[
+                SchemaField("id", "INTEGER"),
+                SchemaField("name", "STRING"),
+            ],
+        )
+        self.client.create_table(table)
+
+        job_config = LoadJobConfig(
+            source_format=SourceFormat.CSV,
+            schema=[
+                SchemaField("id", "INTEGER"),
+                SchemaField("name", "STRING"),
+                SchemaField("extra", "STRING"),
+            ],
+            schema_update_options=[
+                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+            ],
+            skip_leading_rows=0,
+        )
+        with self.assertRaises(exceptions.BadRequest) as caught:
+            self.client.load_table_from_file(
+                io.StringIO("1,Alice,x\n"),
+                self._table_ref("unmatched"),
+                job_config=job_config,
+            )
+        # The emulator's own refusal, rather than anything the client decided locally.
+        self.assertIn("schemaUpdateOptions", str(caught.exception))
+
     # ---- the job resource ----
 
     def test_the_job_reports_what_it_read_and_wrote(self) -> None:
