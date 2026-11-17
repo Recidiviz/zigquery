@@ -87,6 +87,122 @@
                 .{ 789, 3, 1.99 },
             },
         },
+        // A grouping set yields one row per group whether or not the select list reads its
+        // columns. The rows are five (sku, day) groups, three sku groups and the grand total.
+        // query-syntax.md#group_by_rollup
+        .{
+            .desc = "rollup selecting none of its grouping columns",
+            .sql =
+            \\WITH Sales AS (
+            \\  SELECT 123 AS sku, 1 AS day, 9.99 AS price UNION ALL
+            \\  SELECT 123, 1, 8.99 UNION ALL
+            \\  SELECT 456, 1, 4.56 UNION ALL
+            \\  SELECT 123, 2, 9.99 UNION ALL
+            \\  SELECT 789, 3, 1.00 UNION ALL
+            \\  SELECT 456, 3, 4.25 UNION ALL
+            \\  SELECT 789, 3, 0.99
+            \\)
+            \\SELECT COUNT(*) AS n
+            \\FROM Sales
+            \\GROUP BY ROLLUP(sku, day)
+            ,
+            .unordered = true,
+            .rows = .{
+                .{ 2 },
+                .{ 1 },
+                .{ 1 },
+                .{ 1 },
+                .{ 2 },
+                .{ 3 },
+                .{ 2 },
+                .{ 2 },
+                .{ 7 },
+            },
+        },
+        // day is NULL in the rows of the sets that roll it up, which are the three sku groups and
+        // the grand total.
+        // query-syntax.md#group_by_rollup
+        .{
+            .desc = "rollup selecting only its second grouping column",
+            .sql =
+            \\WITH Sales AS (
+            \\  SELECT 123 AS sku, 1 AS day, 9.99 AS price UNION ALL
+            \\  SELECT 123, 1, 8.99 UNION ALL
+            \\  SELECT 456, 1, 4.56 UNION ALL
+            \\  SELECT 123, 2, 9.99 UNION ALL
+            \\  SELECT 789, 3, 1.00 UNION ALL
+            \\  SELECT 456, 3, 4.25 UNION ALL
+            \\  SELECT 789, 3, 0.99
+            \\)
+            \\SELECT day, COUNT(*) AS n
+            \\FROM Sales
+            \\GROUP BY ROLLUP(sku, day)
+            ,
+            .unordered = true,
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 1, 1 },
+                .{ 3, 1 },
+                .{ 3, 2 },
+                .{ null, 3 },
+                .{ null, 2 },
+                .{ null, 2 },
+                .{ null, 7 },
+            },
+        },
+        // One row per group of each set, three skus and three days, each carrying the constant.
+        // query-syntax.md#group_by_grouping_sets
+        .{
+            .desc = "grouping sets with a constant select list",
+            .sql =
+            \\WITH Sales AS (
+            \\  SELECT 123 AS sku, 1 AS day, 9.99 AS price UNION ALL
+            \\  SELECT 123, 1, 8.99 UNION ALL
+            \\  SELECT 456, 1, 4.56 UNION ALL
+            \\  SELECT 123, 2, 9.99 UNION ALL
+            \\  SELECT 789, 3, 1.00 UNION ALL
+            \\  SELECT 456, 3, 4.25 UNION ALL
+            \\  SELECT 789, 3, 0.99
+            \\)
+            \\SELECT 'x' AS c
+            \\FROM Sales
+            \\GROUP BY GROUPING SETS(sku, day)
+            ,
+            .unordered = true,
+            .rows = .{
+                .{ "x" },
+                .{ "x" },
+                .{ "x" },
+                .{ "x" },
+                .{ "x" },
+                .{ "x" },
+            },
+        },
+        // One row per sku, though no column of the aggregation is read.
+        .{
+            .desc = "group by with a constant select list",
+            .sql =
+            \\WITH Sales AS (
+            \\  SELECT 123 AS sku, 1 AS day, 9.99 AS price UNION ALL
+            \\  SELECT 123, 1, 8.99 UNION ALL
+            \\  SELECT 456, 1, 4.56 UNION ALL
+            \\  SELECT 123, 2, 9.99 UNION ALL
+            \\  SELECT 789, 3, 1.00 UNION ALL
+            \\  SELECT 456, 3, 4.25 UNION ALL
+            \\  SELECT 789, 3, 0.99
+            \\)
+            \\SELECT 'x' AS c
+            \\FROM Sales
+            \\GROUP BY sku
+            ,
+            .unordered = true,
+            .rows = .{
+                .{ "x" },
+                .{ "x" },
+                .{ "x" },
+            },
+        },
         .{
             .desc = "group by having",
             .sql =

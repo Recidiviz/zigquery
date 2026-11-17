@@ -619,6 +619,9 @@ int GoogleSQL_AnalyzeNextStatementWithCatalogParams(
   }
 
   googlesql::AnalyzerOptions options(handle->lang);
+  // Scans list only the columns the statement references, so a window or a sort carries no column
+  // its consumer never reads.
+  options.set_prune_unused_columns(true);
   // BigQuery reads a TIMESTAMP literal with no zone, and every other
   // zoneless civil time the analyzer folds, as UTC.
   options.set_default_time_zone(absl::UTCTimeZone());
@@ -709,6 +712,7 @@ int GoogleSQL_AnalyzeNextStatementParams(
   }
 
   googlesql::AnalyzerOptions options(lang);
+  options.set_prune_unused_columns(true);
   // See the note in the handle variant on the default time zone.
   options.set_default_time_zone(absl::UTCTimeZone());
   // options_json carries the parameter mode: `{"parameter_mode":"positional"}`

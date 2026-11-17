@@ -2052,8 +2052,12 @@ googlesql/compliance/grouping_sets_queries	grouping_sets_with_alias
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_ordinal_columns
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_mix_of_column_alias_ordinal_index
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_duplicate_simple_expressions
+googlesql/compliance/grouping_sets_queries	grouping_sets_with_duplicate_subquery_expressions
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_collation_columns
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_analytic_functions
+googlesql/compliance/grouping_sets_queries	grouping_sets_with_subquery_constant
+googlesql/compliance/grouping_sets_queries	grouping_sets_with_subquery_from_the_table
+googlesql/compliance/grouping_sets_queries	grouping_sets_with_correlated_subquery
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_keyword_column_name
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_rollup_cube
 googlesql/compliance/grouping_sets_queries	grouping_sets_with_rollup_cube_on_multi_columns
@@ -2081,6 +2085,7 @@ googlesql/compliance/grouping_sets_queries	rollup_with_duplicate_mix_of_column_a
 googlesql/compliance/grouping_sets_queries	rollup_with_mix_of_column_alias_ordinal_index
 googlesql/compliance/grouping_sets_queries	rollup_expression_match
 googlesql/compliance/grouping_sets_queries	rollup_multi_column_expression_match
+googlesql/compliance/grouping_sets_queries	rollup_with_subquery
 googlesql/compliance/grouping_sets_queries	rollup_with_collation_columns
 googlesql/compliance/grouping_sets_queries	cube_simple_query
 googlesql/compliance/grouping_sets_queries	cube_simple_query_no_grouping
@@ -2100,6 +2105,7 @@ googlesql/compliance/grouping_sets_queries	cube_with_unpivot
 googlesql/compliance/grouping_sets_queries	cube_and_with_recursive
 googlesql/compliance/grouping_sets_queries	cube_expression_match
 googlesql/compliance/grouping_sets_queries	cube_multi_column_expression_match
+googlesql/compliance/grouping_sets_queries	cube_with_subquery
 googlesql/compliance/grouping_sets_queries	cube_with_keyword_column_name
 googlesql/compliance/grouping_sets_queries	rollup_with_analytic_functions
 googlesql/compliance/grouping_sets_queries	rollup_with_qualify_clauses
@@ -5063,6 +5069,10 @@ zigquery/functions/utility/generate_uuid	generate_uuid
 zigquery/functions/utility/safe_prefix	safe on a function that is neither aggregate nor analytic
 zigquery/functions/utility/safe_prefix	safe names the function it was applied to
 zigquery/functions/utility/safe_prefix	a function with no implementation names itself
+zigquery/functions/window/analytic_option_rejections	string_agg with distinct over a window is rejected
+zigquery/functions/window/analytic_option_rejections	array_agg with ignore nulls over a window is rejected
+zigquery/functions/window/analytic_option_rejections	string_agg over a window without distinct
+zigquery/functions/window/analytic_option_rejections	array_agg over a window without ignore nulls
 zigquery/functions/window/cume_dist	cume_dist
 zigquery/functions/window/dense_rank	window dense_rank
 zigquery/functions/window/dense_rank	window dense_rank with group
@@ -5217,6 +5227,10 @@ zigquery/syntax/query/function_arg_limit	function call with many arguments - abo
 zigquery/syntax/query/group_by	group by
 zigquery/syntax/query/group_by	group by rollup with one column
 zigquery/syntax/query/group_by	group by rollup with two columns
+zigquery/syntax/query/group_by	rollup selecting none of its grouping columns
+zigquery/syntax/query/group_by	rollup selecting only its second grouping column
+zigquery/syntax/query/group_by	grouping sets with a constant select list
+zigquery/syntax/query/group_by	group by with a constant select list
 zigquery/syntax/query/group_by	group by having
 zigquery/syntax/query/group_by	group by struct values basic
 zigquery/syntax/query/group_by	group by struct values with aggregation

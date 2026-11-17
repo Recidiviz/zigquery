@@ -134,6 +134,17 @@ pub fn transform(
     return q;
 }
 
+/// The select item of an aggregate whose columns are all unread. The aggregate still yields a row
+/// per group, and a SELECT needs a column to yield them in.
+fn unreadSelectItem(alloc: std.mem.Allocator) Error!*sqlbuilder.SelectListItem {
+    const item = try alloc.create(sqlbuilder.SelectListItem);
+    item.* = .{
+        .expression = try sqlbuilder.newLiteralExpression(alloc, "NULL"),
+        .alias = "zigquery_unread",
+    };
+    return item;
+}
+
 /// GROUPING SETS, ROLLUP and CUBE as a UNION ALL of one SELECT per grouping set, with NULL
 /// projected for the columns a set does not group by, ordered by the grouping columns.
 fn buildGroupingSetsQuery(
@@ -172,7 +183,11 @@ fn buildGroupingSetsQuery(
             if (!set_column_ids.contains(id.*)) try null_column_ids.put(id.*, {});
         }
 
-        const select_list = try alloc.alloc(*sqlbuilder.SelectListItem, output_columns.len);
+        const select_list = try alloc.alloc(
+            *sqlbuilder.SelectListItem,
+            @max(output_columns.len, 1),
+        );
+        if (output_columns.len == 0) select_list[0] = try unreadSelectItem(alloc);
         for (output_columns, 0..) |original_col, i| {
             // GROUPING(x): 1 when this set rolled x up, 0 when it grouped by
             // it. Constant within the set, so it is written as a literal rather
@@ -246,26 +261,27 @@ fn buildGroupingSetsQuery(
 
     // ORDER BY the grouping columns with the value-aware collation so the
     // grouping levels come out in a deterministic ZetaSQL-like order.
-    if (group_by_map.count() > 0) {
-        var order_by_items: std.ArrayList(*sqlbuilder.OrderByItem) = .empty;
-        var val_it = group_by_map.valueIterator();
-        while (val_it.next()) |group_by_col| {
-            // Copy the expression: the ORDER BY term must not alias the GROUP BY one, which
-            // gets `collation` assigned in place.
-            const order_expr = try alloc.create(SQLExpression);
-            order_expr.* = group_by_col.*.*;
+    // An ORDER BY over a compound SELECT names result columns, so its terms are the grouping
+    // columns the output holds.
+    var order_by_items: std.ArrayList(*sqlbuilder.OrderByItem) = .empty;
+    for (column_data) |column| {
+        const group_by_col = group_by_map.get(column.id) orelse continue;
+        // Copy the expression: the ORDER BY term must not alias the GROUP BY one, which
+        // gets `collation` assigned in place.
+        const order_expr = try alloc.create(SQLExpression);
+        order_expr.* = group_by_col.*;
 
-            const item = try alloc.create(sqlbuilder.OrderByItem);
-            item.* = .{ .expression = order_expr, .direction = "ASC" };
-            try order_by_items.append(alloc, item);
-        }
-        union_stmt.order_by_list = try order_by_items.toOwnedSlice(alloc);
+        const item = try alloc.create(sqlbuilder.OrderByItem);
+        item.* = .{ .expression = order_expr, .direction = "ASC" };
+        try order_by_items.append(alloc, item);
     }
+    union_stmt.order_by_list = try order_by_items.toOwnedSlice(alloc);
 
     // Re-project through an inner subquery to introduce the new logical
     // columns (aliases from the first set's SELECT items).
     const statement = try alloc.create(sqlbuilder.SelectStatement);
-    const outer_list = try alloc.alloc(*sqlbuilder.SelectListItem, column_data.len);
+    const outer_list = try alloc.alloc(*sqlbuilder.SelectListItem, @max(column_data.len, 1));
+    if (column_data.len == 0) outer_list[0] = try unreadSelectItem(alloc);
     for (column_data, 0..) |column, i| {
         const item_column = set_operation.items[0].select_list[i];
         const item = try alloc.create(sqlbuilder.SelectListItem);
