@@ -844,6 +844,8 @@ pub const NodeExtractor = struct {
         // Extract target table scan data.
         const target_scan = try alloc.create(ScanData);
         target_scan.* = try extractTableScanData(alloc, table_scan_node);
+        // MERGE matches source rows to target rows by the target's row id.
+        target_scan.table_scan.?.in_place = true;
 
         // Extract source scan data.
         const from_scan = node.from_scan orelse return error.InvalidAST;
