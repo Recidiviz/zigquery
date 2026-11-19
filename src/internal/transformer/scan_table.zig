@@ -126,6 +126,15 @@ pub fn transform(
         try full.appendSlice(alloc, select_list.items);
         select_statement.select_list = try full.toOwnedSlice(alloc);
     }
+    if (table_data.in_place) return select_statement;
 
-    return select_statement;
+    // A table's columns leave the scan under their id-based aliases, behind the scan's own
+    // alias. A raw column name written inside a correlated subquery would bind to whichever
+    // table of that name SQLite finds nearest.
+    // Spec: testdata/specs/zigquery/syntax/query/subquery_correlated_same_name.zon
+    return coord.wrapScan(.{
+        .query = select_statement,
+        .alias = try std.fmt.allocPrint(alloc, "table_scan_{s}", .{ctx.fragmentContext().getID()}),
+        .columns = data.column_list,
+    }, ctx);
 }

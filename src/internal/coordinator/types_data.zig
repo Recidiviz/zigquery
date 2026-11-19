@@ -264,6 +264,9 @@ pub const TableScanData = struct {
     alias: []const u8 = "",
     columns: []const *ColumnData = &.{},
     synthetic_columns: []const *SelectItemData = &.{},
+    /// The scan stays a bare FROM item with raw column names, for a statement that reads the
+    /// table's row id.
+    in_place: bool = false,
 };
 
 /// JoinScanData represents join operation data.

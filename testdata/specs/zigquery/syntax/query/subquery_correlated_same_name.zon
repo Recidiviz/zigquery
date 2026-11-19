@@ -1,0 +1,295 @@
+.{
+    .spec = "zigquery/syntax/query/subquery_correlated_same_name",
+    .dialect = .zigquery,
+    .typed = true,
+    .cases = .{
+        // A correlated reference names the enclosing query's column even when the
+        // subquery's own table has a column of the same name. Rows are BigQuery's,
+        // measured (recidiviz-bigquery-sandbox, 2026-11-19) with the tables in a dataset.
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "scalar count subquery",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "outer column written first in the comparison",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE pr.pr_id = r.pr_id) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "tables without aliases",
+            .sql = "SELECT prs.pr_id, (SELECT COUNT(*) FROM reviews WHERE reviews.pr_id = prs.pr_id) AS n FROM prs ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "array subquery",
+            .sql = "SELECT pr.pr_id, ARRAY_LENGTH(ARRAY(SELECT r.submitted_at FROM reviews AS r WHERE r.pr_id = pr.pr_id)) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "exists subquery in the select list",
+            .sql = "SELECT pr.pr_id, EXISTS(SELECT 1 FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS has FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, true },
+                .{ 2, true },
+                .{ 3, false },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "exists subquery in the filter",
+            .sql = "SELECT pr.pr_id FROM prs AS pr WHERE EXISTS(SELECT 1 FROM reviews AS r WHERE r.pr_id = pr.pr_id) ORDER BY 1",
+            .rows = .{
+                .{1},
+                .{2},
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "in subquery",
+            .sql = "SELECT pr.pr_id, TIMESTAMP '2026-10-14 18:00:00+00' IN (SELECT r.submitted_at FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS hit FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, false },
+                .{ 2, true },
+                .{ 3, false },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "outer query with its own filter",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS n FROM prs AS pr WHERE pr.pr_id < 3 ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+                "CREATE VIEW rv AS SELECT * FROM reviews",
+            },
+            .desc = "subquery reads a view",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM rv AS r WHERE r.pr_id = pr.pr_id) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+                "CREATE VIEW pv AS SELECT * FROM prs",
+            },
+            .desc = "outer query reads a view",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS n FROM pv AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "same table inside and outside",
+            .sql = "SELECT a.pr_id, (SELECT COUNT(*) FROM reviews AS b WHERE b.pr_id = a.pr_id AND b.submitted_at <= a.submitted_at) AS seq FROM reviews AS a ORDER BY a.pr_id, a.submitted_at",
+            .rows = .{
+                .{ 1, 1 },
+                .{ 1, 2 },
+                .{ 2, 1 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, ts TIMESTAMP)",
+                "CREATE TABLE reviews (reviewed_pr INT64, ts TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "shared name on a column that is not the key",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.reviewed_pr = pr.pr_id AND r.ts > pr.ts) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, ts TIMESTAMP)",
+                "CREATE TABLE reviews (reviewed_pr INT64, ts TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "shared name read in the subquery's select list",
+            .sql = "SELECT pr.pr_id, (SELECT MIN(TIMESTAMP_DIFF(r.ts, pr.ts, HOUR)) FROM reviews AS r WHERE r.reviewed_pr = pr.pr_id) AS hrs FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 65 },
+                .{ 2, 26 },
+                .{ 3, null },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, ts TIMESTAMP)",
+                "CREATE TABLE reviews (reviewed_pr INT64, ts TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "no shared name",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.reviewed_pr = pr.pr_id) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "subquery reads a cte",
+            .sql = "WITH rv AS (SELECT * FROM reviews) SELECT pr.pr_id, (SELECT COUNT(*) FROM rv AS r WHERE r.pr_id = pr.pr_id) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "outer query reads a cte",
+            .sql = "WITH p AS (SELECT * FROM prs) SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS n FROM p AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "both read ctes",
+            .sql = "WITH p AS (SELECT * FROM prs), rv AS (SELECT * FROM reviews) SELECT pr.pr_id, (SELECT COUNT(*) FROM rv AS r WHERE r.pr_id = pr.pr_id) AS n FROM p AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "outer query is a join",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r WHERE r.pr_id = pr.pr_id) AS n FROM prs AS pr CROSS JOIN UNNEST([1]) AS one ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+        .{
+            .setup = .{
+                "CREATE TABLE prs (pr_id INT64, opened_at TIMESTAMP)",
+                "CREATE TABLE reviews (pr_id INT64, submitted_at TIMESTAMP)",
+                "INSERT INTO prs VALUES (1, TIMESTAMP '2026-10-09 21:00:00+00'), (2, TIMESTAMP '2026-10-13 16:00:00+00'), (3, TIMESTAMP '2026-10-15 10:00:00+00')",
+                "INSERT INTO reviews VALUES (1, TIMESTAMP '2026-10-12 14:00:00+00'), (1, TIMESTAMP '2026-10-13 09:00:00+00'), (2, TIMESTAMP '2026-10-14 18:00:00+00')",
+            },
+            .desc = "subquery reads a join",
+            .sql = "SELECT pr.pr_id, (SELECT COUNT(*) FROM reviews AS r JOIN UNNEST([1]) AS one WHERE r.pr_id = pr.pr_id) AS n FROM prs AS pr ORDER BY 1",
+            .rows = .{
+                .{ 1, 2 },
+                .{ 2, 1 },
+                .{ 3, 0 },
+            },
+        },
+    },
+}
