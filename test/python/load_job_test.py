@@ -220,16 +220,71 @@ class TestLoadJobs(BigQueryEmulatorTestCase):
             {f.name: f.field_type for f in table.schema},
         )
 
-    def test_nested_json_is_refused_rather_than_half_read(self) -> None:
+    def test_nested_json_loads_into_a_repeated_record_column(self) -> None:
+        """#119's repro: a load into a table created with a REPEATED RECORD.
+        BigQuery loads both rows, and ARRAY_LENGTH(entries) is 2 and 0."""
+        schema = [
+            SchemaField("id", "INTEGER"),
+            SchemaField(
+                "entries",
+                "RECORD",
+                mode="REPEATED",
+                fields=[
+                    SchemaField("n", "INTEGER"),
+                    SchemaField("ts", "TIMESTAMP"),
+                ],
+            ),
+        ]
+        table = self.client.create_table(
+            bigquery.Table(self._table_ref("nested"), schema=schema)
+        )
+        rows = [
+            {
+                "id": 1,
+                "entries": [
+                    {"n": 1, "ts": "2026-01-15T00:00:00Z"},
+                    {"n": 2, "ts": "2026-01-16T00:00:00Z"},
+                ],
+            },
+            {"id": 2, "entries": []},
+        ]
+        job = self.client.load_table_from_json(rows, table)
+        job.result()
+
+        self.assertIsNone(job.error_result)
+        query = self.client.query(
+            f"SELECT id, ARRAY_LENGTH(entries) AS n FROM "
+            f"`{BQ_EMULATOR_PROJECT_ID}.{_DATASET}.nested` ORDER BY id"
+        )
+        self.assertEqual(
+            [{"id": 1, "n": 2}, {"id": 2, "n": 0}],
+            [{key: row.get(key) for key in row.keys()} for row in query.result()],
+        )
+
+    def test_nested_json_autodetects_record_and_repeated(self) -> None:
+        lines = "\n".join(
+            json.dumps(row)
+            for row in [
+                {"id": 1, "entries": [{"n": 1}], "tags": ["a"]},
+                {"id": 2, "entries": [], "tags": []},
+            ]
+        )
         job_config = LoadJobConfig(
             source_format=SourceFormat.NEWLINE_DELIMITED_JSON, autodetect=True
         )
-        with self.assertRaises(exceptions.BadRequest):
-            self.client.load_table_from_file(
-                io.StringIO('{"a":{"b":1}}\n'),
-                self._table_ref("nested"),
-                job_config=job_config,
-            )
+        job = self.client.load_table_from_file(
+            io.StringIO(lines + "\n"),
+            self._table_ref("nested_detected"),
+            job_config=job_config,
+        )
+        job.result()
+
+        self.assertIsNone(job.error_result)
+        table = self.client.get_table(self._table_ref("nested_detected"))
+        fields = {f.name: f for f in table.schema}
+        self.assertEqual("RECORD", fields["entries"].field_type)
+        self.assertEqual("REPEATED", fields["entries"].mode)
+        self.assertEqual("REPEATED", fields["tags"].mode)
 
     # ---- refusals ----
 
